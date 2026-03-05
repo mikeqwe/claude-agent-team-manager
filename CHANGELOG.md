@@ -1,5 +1,41 @@
 # ATM (Agent Team Manager) — Changelog
 
+## v0.8.0 — March 4, 2026
+
+### New Feature: Remote Access from Mobile (GitHub Issue #14)
+- **Remote control from any phone** — access and manage your agent teams from iPhone or Android using your phone's browser. No app install required
+- **Embedded HTTPS server** — a secure web server runs inside ATM with auto-generated TLS certificates. Scan a QR code from the Settings panel to connect your phone
+- **PIN-based authentication** — 6-digit server-generated PIN displayed on desktop, entered on phone. Rate limited with lockout after 5 failed attempts
+- **Real-time sync via WebSocket** — changes on desktop instantly appear on mobile and vice versa. Full bidirectional state synchronization
+- **Mobile-optimized tree view** — collapsible card-based hierarchy with color-coded nodes, search, kind filters, breadcrumb navigation, and pull-to-refresh
+- **Remote editing** — edit agent names, prompts, tags, and variables directly from your phone
+- **Pipeline deployment** — trigger pipeline deploys from mobile with real-time status updates
+- **Optimistic locking** — conflict detection with version numbers prevents silent data loss when editing from multiple devices simultaneously
+- **Secret redaction** — API keys and passwords are automatically masked (****xxxx) in remote responses to prevent leaking secrets over the network
+- **Session management** — up to 2 concurrent remote sessions with 30-minute idle timeout. Sessions auto-expire and PINs regenerate after each successful auth
+- **Settings panel integration** — new Remote Access section in Settings with enable/disable toggle, QR code display, PIN code, port configuration, and network exposure control
+
+### Security
+- Auto-generated self-signed TLS certificates (HTTPS only, no plaintext)
+- CORS origin validation on all endpoints
+- Bearer token authentication for API endpoints
+- WebSocket origin checking
+- Default bind to 127.0.0.1 (localhost only) — explicit opt-in required for LAN exposure
+- Server OFF by default — only starts when user enables it
+
+### Technical
+- New Rust modules: `server/` with auth.rs, bridge.rs, server.rs, state.rs, ws.rs, qr.rs
+- Cargo dependencies: axum 0.8, axum-server 0.7 (TLS), tokio, tower-http, rcgen, qrcode, image
+- New TypeScript types: `src/types/remote.ts` with full Zod schema validation
+- New service: `src/services/remote-sync.ts` — WebSocket sync service with echo loop prevention
+- Tree store integration: `initRemoteSync()` with node diff broadcasting and remote command handling
+- UI store integration: `remoteConfig`, `connectRemote()`, `disconnectRemote()`
+- Mobile web client: vanilla HTML/CSS/JS SPA served as static files from `remote-ui/`
+- Mobile tree visualization: `src/components/remote/MobileTreeView.tsx`
+- Settings panel: new Remote Access section with QR code, PIN display, and configuration
+
+---
+
 ## v0.6.2 — February 25, 2026
 
 ### Bug Fix: Multi-Select Drag

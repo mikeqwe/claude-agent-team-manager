@@ -1,4 +1,15 @@
 import { create } from "zustand";
+import { REMOTE_CONFIG_DEFAULTS, type RemoteConfig } from "@/types/remote";
+import { remoteSync } from "@/services/remote-sync";
+
+interface RemoteState {
+  /** Remote server configuration (persisted to .aui/remote.json) */
+  remoteConfig: RemoteConfig;
+  /** Whether the desktop WebSocket is connected to the local server */
+  remoteConnected: boolean;
+  /** Number of mobile clients currently connected */
+  remoteClientCount: number;
+}
 
 interface UiState {
   selectedNodeId: string | null;
@@ -19,6 +30,19 @@ interface UiState {
   toasts: Array<{ id: string; message: string; type: 'success' | 'error' | 'info' }>;
   collapsedGroups: Set<string>;
   multiSelectedNodeIds: Set<string>;
+}
+
+interface RemoteActions {
+  /** Update remote server config and optionally persist. */
+  setRemoteConfig(updates: Partial<RemoteConfig>): void;
+  /** Load remote config from .aui/remote.json. */
+  loadRemoteConfig(projectPath: string): Promise<void>;
+  /** Persist remote config to .aui/remote.json. */
+  saveRemoteConfig(projectPath: string): Promise<void>;
+  /** Start the desktop WebSocket connection to the local server. */
+  connectRemote(): void;
+  /** Stop the desktop WebSocket connection. */
+  disconnectRemote(): void;
 }
 
 interface UiActions {
@@ -46,9 +70,12 @@ interface UiActions {
   expandAllGroups(): void;
 }
 
-type UiStore = UiState & UiActions;
+type UiStore = UiState & RemoteState & UiActions & RemoteActions;
+
+const DEFAULT_REMOTE_CONFIG: RemoteConfig = { ...REMOTE_CONFIG_DEFAULTS };
 
 export const useUiStore = create<UiStore>()((set, get) => ({
+  // ── UI state ──────────────────────────────────────
   selectedNodeId: null,
   inspectorOpen: true,
   contextHubOpen: false,
@@ -67,6 +94,11 @@ export const useUiStore = create<UiStore>()((set, get) => ({
   toasts: [],
   collapsedGroups: new Set<string>(),
   multiSelectedNodeIds: new Set<string>(),
+
+  // ── Remote state ──────────────────────────────────
+  remoteConfig: { ...DEFAULT_REMOTE_CONFIG },
+  remoteConnected: false,
+  remoteClientCount: 0,
 
   selectNode(id: string | null) {
     if (id !== null) {
@@ -208,5 +240,58 @@ export const useUiStore = create<UiStore>()((set, get) => ({
 
   expandAllGroups() {
     set({ collapsedGroups: new Set<string>() });
+  },
+
+  // ── Remote actions ──────────────────────────────────
+
+  setRemoteConfig(updates: Partial<RemoteConfig>) {
+    set((state) => ({
+      remoteConfig: { ...state.remoteConfig, ...updates },
+    }));
+  },
+
+  async loadRemoteConfig(projectPath: string) {
+    try {
+      const { readTextFile, exists } = await import("@tauri-apps/plugin-fs");
+      const configPath = projectPath.replace(/\\/g, "/") + "/.aui/remote.json";
+      if (await exists(configPath)) {
+        const raw = await readTextFile(configPath);
+        const parsed = JSON.parse(raw);
+        set((state) => ({
+          remoteConfig: { ...DEFAULT_REMOTE_CONFIG, ...parsed },
+        }));
+      }
+    } catch (err) {
+      console.warn("[ATM] Failed to load remote config:", err);
+    }
+  },
+
+  async saveRemoteConfig(projectPath: string) {
+    try {
+      const { writeTextFile, exists, mkdir } = await import("@tauri-apps/plugin-fs");
+      const auiDir = projectPath.replace(/\\/g, "/") + "/.aui";
+      if (!(await exists(auiDir))) {
+        await mkdir(auiDir, { recursive: true });
+      }
+      const configPath = auiDir + "/remote.json";
+      await writeTextFile(configPath, JSON.stringify(get().remoteConfig, null, 2));
+    } catch (err) {
+      console.warn("[ATM] Failed to save remote config:", err);
+    }
+  },
+
+  connectRemote() {
+    // Listen for connection changes from the sync service
+    remoteSync.onConnectionChange((connected, clientCount) => {
+      set({ remoteConnected: connected, remoteClientCount: clientCount });
+    });
+
+    // Initialize Tauri event listeners for server started/stopped events
+    remoteSync.init();
+  },
+
+  disconnectRemote() {
+    remoteSync.dispose();
+    set({ remoteConnected: false, remoteClientCount: 0 });
   },
 }));

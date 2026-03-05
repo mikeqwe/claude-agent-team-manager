@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "ATM",
-  "version": "0.7.3",
+  "version": "0.8.0",
   "identifier": "com.atm.agent-team-manager",
   "build": {
     "frontendDist": "../dist",
@@ -26,6 +26,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": [
+      "remote-ui/**/*"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

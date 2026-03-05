@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import { readTextFile, writeTextFile, exists, mkdir, remove } from "@tauri-apps/plugin-fs";
 import type { AuiNode, TreeMetadata, TreeExport, PipelineStep } from "@/types/aui-node";
+import type { RemoteMessage, UpdateNodePayload, ReparentNodePayload, AddNodePayload, RemoveNodePayload } from "@/types/remote";
+import { redactNode } from "@/types/remote";
 import { scanProject } from "@/services/file-scanner";
 import { parseAgentFile } from "@/services/agent-parser";
 import { parseSkillFile } from "@/services/skill-parser";
@@ -18,6 +20,7 @@ import {
 } from "@/services/layout-service";
 import { getVersion } from "@tauri-apps/api/app";
 import { packExportZip, unpackExportZip } from "@/services/zip-service";
+import { remoteSync, nodeToRemote, serializeNodes } from "@/services/remote-sync";
 
 interface TreeState {
   nodes: Map<string, AuiNode>;
@@ -77,6 +80,8 @@ interface TreeActions {
   copyNodes(nodeId: string): void;
   duplicateNodes(nodeId: string): Promise<string | null>;
   pasteNodes(targetParentId: string): Promise<string | null>;
+  /** Initialize remote sync: subscribe to store changes and handle incoming commands. */
+  initRemoteSync(): () => void;
 }
 
 type TreeStore = TreeState & TreeActions;
@@ -2517,5 +2522,246 @@ IMPORTANT: Each agent already has their full skill file content above. Pass it d
 
     get().saveTreeMetadata();
     return result.newRootId;
+  },
+
+  // ── Remote Sync ──────────────────────────────────────
+  //
+  // IPC Pathway Specification — which tree-store actions sync and which don't:
+  //
+  // SYNCED (broadcast to remote clients via WebSocket):
+  //   addNode()            -> node_added   (detected by subscribe diff)
+  //   updateNode()         -> node_updated (detected by subscribe diff: lastModified/name/parentId change)
+  //   removeNode()         -> node_removed (detected by subscribe diff: node absent from new state)
+  //   reparentNode()       -> node_updated (parentId change detected by subscribe diff)
+  //   createAgentNode()    -> node_added   (adds to nodes Map, triggers diff)
+  //   createSkillNode()    -> node_added   (adds to nodes Map, triggers diff)
+  //   createGroupNode()    -> node_added   (adds to nodes Map, triggers diff)
+  //   createPipelineNode() -> node_added   (adds to nodes Map, triggers diff)
+  //   removeNodeFromCanvas() -> node_removed (removes from nodes Map, triggers diff)
+  //   deleteNodeFromDisk() -> node_removed (removes from nodes Map, triggers diff)
+  //   syncFromDisk()       -> node_updated (re-parsed nodes get new lastModified, triggers diff)
+  //   loadProject()        -> full_sync    (full resync sent on reconnect, not on initial load)
+  //
+  // NOT SYNCED (local-only or non-state operations):
+  //   saveNode()           -> disk I/O only, no state change (node already updated in store)
+  //   saveTreeMetadata()   -> disk I/O only, persists hierarchy/positions to .aui/tree.json
+  //   loadTreeMetadata()   -> read-only, used during loadProject()
+  //   exportTeamAsSkill()  -> generates output string, no state change
+  //   generateTeamSkillFiles() -> disk I/O, no state change
+  //   saveCompanyPlan()    -> generates output string, no state change
+  //   exportTreeAsJson()   -> pure serialization, no state change
+  //   exportTreeAsZip()    -> pure serialization, no state change
+  //   importTreeFromJson() -> replaces entire state (triggers full diff broadcast)
+  //   importTreeFromZip()  -> replaces entire state (triggers full diff broadcast)
+  //   deployPipeline()     -> launches external terminal, no node state change
+  //   copyNodes()          -> updates clipboard only, not tree data
+  //   cacheSkillName()     -> updates skillNameCache, not nodes Map
+  //   layout actions        -> layout data is not synced (desktop-only spatial arrangement)
+  //   sticky note actions   -> node_added/updated/removed (treated as regular nodes)
+  //
+  // CONFLICT RESOLUTION:
+  //   update_node commands include expectedLastModified for optimistic locking.
+  //   If the client's expected version does not match the current lastModified,
+  //   the update is rejected with a CONFLICT error and the current node state
+  //   is sent back so the client can reconcile.
+  //
+  // ECHO LOOP PREVENTION:
+  //   remoteSync.markRemoteOrigin() is called before applying any remote command.
+  //   The subscribe callback checks consumeRemoteOrigin() and skips broadcasting
+  //   if the mutation originated from a remote client.
+  //
+  // RECONNECT BEHAVIOR:
+  //   On WebSocket reconnect (not first connect), a full_sync event is broadcast
+  //   containing all serialized nodes + tree metadata so remote clients can
+  //   rebuild their state from scratch rather than replaying missed deltas.
+  //
+
+  initRemoteSync(): () => void {
+    // Track previous nodes snapshot for diffing
+    let prevNodes: Map<string, AuiNode> = new Map(get().nodes);
+
+    // 1. Subscribe to local store changes and broadcast diffs to remote clients
+    const unsubscribe = useTreeStore.subscribe((state) => {
+      // If this mutation was triggered by a remote command, don't re-broadcast
+      if (remoteSync.consumeRemoteOrigin()) {
+        prevNodes = new Map(state.nodes);
+        return;
+      }
+
+      const currNodes = state.nodes;
+
+      // Detect added/updated nodes
+      for (const [id, node] of currNodes) {
+        const prev = prevNodes.get(id);
+        if (!prev) {
+          // Node was added
+          remoteSync.broadcastEvent("node_added", {
+            node: nodeToRemote(node),
+          });
+        } else if (prev.lastModified !== node.lastModified || prev.name !== node.name || prev.parentId !== node.parentId) {
+          // Node was updated
+          remoteSync.broadcastEvent("node_updated", {
+            id: node.id,
+            node: nodeToRemote(node),
+          });
+        }
+      }
+
+      // Detect removed nodes
+      for (const [id] of prevNodes) {
+        if (!currNodes.has(id)) {
+          remoteSync.broadcastEvent("node_removed", { id });
+        }
+      }
+
+      prevNodes = new Map(currNodes);
+    });
+
+    // 2. On reconnect, send full state snapshot to resync remote clients
+    const unsubReconnect = remoteSync.onReconnect(() => {
+      const nodes = serializeNodes(get().nodes);
+      const { metadata } = get();
+      remoteSync.broadcastEvent("full_sync", {
+        nodes,
+        metadata: {
+          owner: metadata?.owner ?? { name: "Owner", description: "" },
+          hierarchy: metadata?.hierarchy ?? {},
+          positions: metadata?.positions ?? {},
+          groups: metadata?.groups,
+          lastModified: metadata?.lastModified ?? Date.now(),
+          skillNameCache: metadata?.skillNameCache,
+        },
+      });
+      console.log("[RemoteSync] Sent full resync after reconnect");
+    });
+
+    // 3. Handle incoming remote commands from mobile clients
+    const unsubPush = remoteSync.onPush((msg: RemoteMessage) => {
+      switch (msg.type) {
+        case "update_node": {
+          const payload = msg.payload as UpdateNodePayload;
+          const existing = get().nodes.get(payload.id);
+          if (!existing) {
+            remoteSync.broadcastEvent("error", {
+              code: "NOT_FOUND",
+              message: `Node ${payload.id} not found`,
+            });
+            return;
+          }
+
+          // Optimistic locking: reject if the client's version is stale
+          if (payload.expectedLastModified !== existing.lastModified) {
+            remoteSync.broadcastEvent("error", {
+              code: "CONFLICT",
+              message: `Node ${payload.id} was modified since your last read. Expected version ${payload.expectedLastModified}, current version ${existing.lastModified}.`,
+            });
+            // Send the current node state so the client can reconcile
+            remoteSync.broadcastEvent("node_updated", {
+              id: existing.id,
+              node: nodeToRemote(existing),
+            });
+            return;
+          }
+
+          remoteSync.markRemoteOrigin();
+          get().updateNode(payload.id, {
+            ...payload.updates,
+            lastModified: Date.now(),
+          });
+          // Persist file-backed nodes
+          if (existing.sourcePath) {
+            get().saveNode(payload.id);
+          }
+          get().saveTreeMetadata();
+          break;
+        }
+
+        case "reparent_node": {
+          const payload = msg.payload as ReparentNodePayload;
+          remoteSync.markRemoteOrigin();
+          get().reparentNode(payload.id, payload.newParentId);
+          break;
+        }
+
+        case "add_node": {
+          const payload = msg.payload as AddNodePayload;
+          const kind = payload.kind;
+
+          // For file-backed nodes, delegate to the existing create methods
+          if (kind === "agent") {
+            remoteSync.markRemoteOrigin();
+            get().createAgentNode(
+              payload.name,
+              payload.promptBody ?? "",
+              payload.parentId ?? undefined,
+            );
+          } else if (kind === "skill") {
+            remoteSync.markRemoteOrigin();
+            get().createSkillNode(
+              payload.name,
+              payload.promptBody ?? "",
+              payload.parentId ?? undefined,
+            );
+          } else if (kind === "group") {
+            remoteSync.markRemoteOrigin();
+            get().createGroupNode(
+              payload.name,
+              payload.promptBody ?? "",
+              payload.parentId ?? undefined,
+            );
+          } else if (kind === "pipeline") {
+            remoteSync.markRemoteOrigin();
+            get().createPipelineNode(
+              payload.name,
+              payload.promptBody ?? "",
+              payload.parentId ?? undefined,
+            );
+          }
+          break;
+        }
+
+        case "remove_node": {
+          const payload = msg.payload as RemoveNodePayload;
+          remoteSync.markRemoteOrigin();
+          get().deleteNodeFromDisk(payload.id);
+          break;
+        }
+
+        case "get_tree": {
+          // Respond with full tree snapshot
+          const nodes = serializeNodes(get().nodes);
+          const { metadata } = get();
+          remoteSync.broadcastEvent("full_sync", {
+            nodes,
+            metadata: {
+              owner: metadata?.owner ?? { name: "Owner", description: "" },
+              hierarchy: metadata?.hierarchy ?? {},
+              positions: metadata?.positions ?? {},
+              groups: metadata?.groups,
+              lastModified: metadata?.lastModified ?? Date.now(),
+              skillNameCache: metadata?.skillNameCache,
+            },
+          });
+          break;
+        }
+
+        case "deploy_pipeline": {
+          const payload = msg.payload as { id: string };
+          get().deployPipeline(payload.id);
+          break;
+        }
+
+        default:
+          // Unknown command — ignore
+          break;
+      }
+    });
+
+    // Return cleanup function
+    return () => {
+      unsubscribe();
+      unsubReconnect();
+      unsubPush();
+    };
   },
 }));

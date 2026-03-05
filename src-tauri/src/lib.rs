@@ -1,7 +1,14 @@
+mod remote;
+
+use remote::ServerHandle;
 use std::process::Command as StdCommand;
+use std::sync::Mutex;
+use tauri::{Emitter, Manager};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+
+// ─── Existing Tauri Commands ────────────────────────────────────────
 
 /// Creates a scheduled task that runs a PowerShell script at the specified time.
 /// On Windows, uses schtasks.exe. On macOS/Linux, uses crontab.
@@ -65,8 +72,6 @@ fn create_scheduled_task(
 
     #[cfg(not(target_os = "windows"))]
     {
-        // macOS/Linux: append a crontab entry
-        // Convert our repeat + time into a cron expression
         let cron_line = match repeat.as_str() {
             "hourly" => format!("0 * * * *"),
             "daily" => {
@@ -88,7 +93,6 @@ fn create_scheduled_task(
                 format!("{} {} 1 * *", min, hour)
             }
             _ => {
-                // ONCE: use `at` or a one-shot cron
                 let parts: Vec<&str> = start_time.split(':').collect();
                 let hour = parts.get(0).unwrap_or(&"9");
                 let min = parts.get(1).unwrap_or(&"0");
@@ -101,7 +105,6 @@ fn create_scheduled_task(
             cron_line, script_path, task_name
         );
 
-        // Read existing crontab, append new entry
         let existing = StdCommand::new("crontab")
             .arg("-l")
             .output()
@@ -132,8 +135,6 @@ fn create_scheduled_task(
 }
 
 /// Lists all AUI scheduled tasks.
-/// On Windows, queries schtasks under the AUI\ folder.
-/// On macOS/Linux, searches crontab for AUI: markers.
 #[tauri::command]
 fn list_scheduled_tasks() -> Result<String, String> {
     #[cfg(target_os = "windows")]
@@ -144,7 +145,6 @@ fn list_scheduled_tasks() -> Result<String, String> {
             .output()
             .map_err(|e| format!("Failed to query schtasks: {}", e))?;
 
-        // schtasks returns non-zero if no tasks found — that's OK
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         Ok(stdout)
     }
@@ -157,7 +157,6 @@ fn list_scheduled_tasks() -> Result<String, String> {
             .map_err(|e| format!("Failed to read crontab: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        // Filter to only AUI entries
         let aui_entries: Vec<&str> = stdout
             .lines()
             .filter(|line| line.contains("# AUI:"))
@@ -167,7 +166,6 @@ fn list_scheduled_tasks() -> Result<String, String> {
 }
 
 /// Deletes a scheduled task by name.
-/// On Windows, removes from Task Scheduler. On macOS/Linux, removes from crontab.
 #[tauri::command]
 fn delete_scheduled_task(task_name: String) -> Result<String, String> {
     #[cfg(target_os = "windows")]
@@ -225,22 +223,17 @@ fn delete_scheduled_task(task_name: String) -> Result<String, String> {
 }
 
 /// Opens a visible terminal window running the given script.
-/// On Windows, uses CREATE_NEW_CONSOLE to bypass Tauri's CREATE_NO_WINDOW flag.
 #[tauri::command]
 fn open_terminal(script_path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        // Use `cmd /c start` to launch PowerShell as a fully independent process.
-        // Direct spawning via CREATE_NEW_CONSOLE gets killed in the Tauri context.
-        // `start` uses ShellExecuteEx internally which fully detaches the process.
-        // We use raw_arg to control the exact command line (no Rust auto-quoting).
         let raw = format!(
             "/c start \"Deploy\" powershell.exe -NoExit -ExecutionPolicy Bypass -File \"{}\"",
             script_path
         );
         StdCommand::new("cmd.exe")
             .raw_arg(raw)
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW for cmd.exe itself
+            .creation_flags(0x08000000)
             .spawn()
             .map_err(|e| format!("Failed to open terminal: {}", e))?;
     }
@@ -262,7 +255,6 @@ fn open_terminal(script_path: String) -> Result<(), String> {
 
     #[cfg(target_os = "linux")]
     {
-        // Try common terminal emulators in order
         let terminals = [
             ("x-terminal-emulator", vec!["-e", &script_path]),
             ("gnome-terminal", vec!["--", &script_path]),
@@ -284,7 +276,6 @@ fn open_terminal(script_path: String) -> Result<(), String> {
 }
 
 /// Fetches a URL and returns its body as a string.
-/// Bypasses webview CORS/CSP restrictions by running in Rust.
 #[tauri::command]
 fn fetch_url(url: String) -> Result<String, String> {
     let output = StdCommand::new("curl")
@@ -301,6 +292,240 @@ fn fetch_url(url: String) -> Result<String, String> {
         .map_err(|e| format!("Invalid UTF-8 in response: {}", e))
 }
 
+// ─── Remote Access Tauri Commands ───────────────────────────────────
+//
+// NOTE: open_terminal, fetch_url, and create_scheduled_task are NOT
+// exposed to remote clients (M5). These commands are desktop-only.
+
+/// Start the remote access server. Called from the frontend when user enables remote access.
+#[tauri::command]
+async fn start_remote_server(
+    app: tauri::AppHandle,
+    port: Option<u16>,
+    expose_on_network: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    // Check if already running.
+    if let Some(state) = app.try_state::<Mutex<Option<ServerHandle>>>() {
+        let guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
+        if guard.is_some() {
+            return Err("Remote server is already running".to_string());
+        }
+    }
+
+    let config = remote::ServerConfig {
+        port: port.unwrap_or(5175),
+        expose_on_network: expose_on_network.unwrap_or(false),
+        static_dir: app
+            .path()
+            .resource_dir()
+            .ok()
+            .map(|p| p.join("remote-ui").to_string_lossy().to_string()),
+    };
+
+    let handle = remote::start_server(config, app.clone()).await?;
+
+    let pin = handle.auth.get_pin().await;
+    let actual_port = handle.actual_port;
+    let cert_fingerprint = handle.cert_fingerprint.clone();
+
+    let ip = local_ip_address::local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
+
+    let url = format!("https://{}:{}", ip, actual_port);
+
+    // Store the server handle in Tauri managed state.
+    app.manage(Mutex::new(Some(handle)));
+
+    // Emit event to frontend.
+    let _ = app.emit(
+        "remote-server-started",
+        serde_json::json!({
+            "url": url,
+            "port": actual_port,
+            "ip": ip,
+            "pin": pin,
+            "certFingerprint": cert_fingerprint,
+        }),
+    );
+
+    Ok(serde_json::json!({
+        "url": url,
+        "port": actual_port,
+        "ip": ip,
+        "pin": pin,
+        "certFingerprint": cert_fingerprint,
+    }))
+}
+
+/// Stop the remote access server.
+#[tauri::command]
+async fn stop_remote_server(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app
+        .try_state::<Mutex<Option<ServerHandle>>>()
+        .ok_or("Server not initialized")?;
+
+    // Extract auth clone and shutdown inside a sync block to avoid holding
+    // the MutexGuard across an await point (MutexGuard is not Send).
+    let auth_clone = {
+        let mut guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
+        match guard.as_mut() {
+            Some(handle) => {
+                let auth = handle.auth.clone();
+                handle.shutdown();
+                *guard = None;
+                Some(auth)
+            }
+            None => None,
+        }
+    };
+
+    match auth_clone {
+        Some(auth) => {
+            auth.revoke_all_sessions().await;
+            let _ = app.emit("remote-server-stopped", serde_json::json!({}));
+            Ok(())
+        }
+        None => Err("Remote server is not running".to_string()),
+    }
+}
+
+/// Get the current remote server status.
+#[tauri::command]
+async fn get_remote_status(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let state = app.try_state::<Mutex<Option<ServerHandle>>>();
+
+    let info = match state {
+        Some(state) => {
+            let guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
+            match guard.as_ref() {
+                Some(handle) => Some((
+                    handle.actual_port,
+                    handle.cert_fingerprint.clone(),
+                    handle.auth.clone(),
+                )),
+                None => None,
+            }
+        }
+        None => None,
+    };
+
+    match info {
+        Some((port, fingerprint, auth)) => {
+            let sessions = auth.active_sessions().await;
+            let ip = local_ip_address::local_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|_| "127.0.0.1".to_string());
+
+            Ok(serde_json::json!({
+                "running": true,
+                "port": port,
+                "url": format!("https://{}:{}", ip, port),
+                "certFingerprint": fingerprint,
+                "activeSessions": sessions,
+            }))
+        }
+        None => Ok(serde_json::json!({ "running": false })),
+    }
+}
+
+/// Get the current PIN (displayed on desktop for the user to share with their phone).
+#[tauri::command]
+async fn get_remote_pin(app: tauri::AppHandle) -> Result<String, String> {
+    let state = app
+        .try_state::<Mutex<Option<ServerHandle>>>()
+        .ok_or("Server not initialized")?;
+
+    let auth = {
+        let guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
+        match guard.as_ref() {
+            Some(handle) => Ok(handle.auth.clone()),
+            None => Err("Remote server is not running".to_string()),
+        }
+    }?;
+
+    Ok(auth.get_pin().await)
+}
+
+/// Broadcast an event to all connected remote WebSocket clients via the bridge.
+/// Called from the frontend when local state changes need to be pushed to mobile clients.
+#[tauri::command]
+fn broadcast_to_remote(
+    app: tauri::AppHandle,
+    event_type: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    let state = app
+        .try_state::<Mutex<Option<ServerHandle>>>()
+        .ok_or("Server not initialized")?;
+
+    let bridge = {
+        let guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
+        match guard.as_ref() {
+            Some(handle) => Ok(handle.bridge.clone()),
+            None => Err("Remote server is not running".to_string()),
+        }
+    }?;
+
+    // Generate a simple unique ID using random bytes from rand (already a dependency).
+    let mut rng = rand::rng();
+    let bytes: [u8; 8] = rand::Rng::random(&mut rng);
+    let id = hex::encode(bytes);
+    bridge.broadcast_event(&event_type, &id, payload);
+    Ok(())
+}
+
+/// Push the full app state to the Rust shared state so the REST API
+/// and new WebSocket clients can access it without going through WebSocket.
+#[tauri::command]
+async fn sync_state_to_remote(
+    app: tauri::AppHandle,
+    nodes: serde_json::Value,
+    layouts: serde_json::Value,
+    settings: serde_json::Value,
+) -> Result<(), String> {
+    let state = app
+        .try_state::<Mutex<Option<ServerHandle>>>()
+        .ok_or("Server not initialized")?;
+
+    let bridge = {
+        let guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
+        match guard.as_ref() {
+            Some(handle) => Ok(handle.bridge.clone()),
+            None => Err("Remote server is not running".to_string()),
+        }
+    }?;
+
+    bridge.store_full_state(nodes, layouts, settings).await;
+    Ok(())
+}
+
+/// Regenerate the remote access PIN.
+#[tauri::command]
+async fn regenerate_remote_pin(app: tauri::AppHandle) -> Result<String, String> {
+    let state = app
+        .try_state::<Mutex<Option<ServerHandle>>>()
+        .ok_or("Server not initialized")?;
+
+    let auth = {
+        let guard = state.lock().map_err(|e| format!("Lock error: {}", e))?;
+        match guard.as_ref() {
+            Some(handle) => Ok(handle.auth.clone()),
+            None => Err("Remote server is not running".to_string()),
+        }
+    }?;
+
+    Ok(auth.regenerate_pin().await)
+}
+
+/// Generate a QR code data URI for the given URL.
+#[tauri::command]
+fn generate_qr_code(url: String) -> Result<String, String> {
+    remote::generate_qr_data_uri(&url)
+}
+
+// ─── App Entry Point ────────────────────────────────────────────────
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -308,11 +533,21 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
+            // Existing commands (desktop-only, NOT exposed remotely per M5).
             open_terminal,
             fetch_url,
             create_scheduled_task,
             list_scheduled_tasks,
             delete_scheduled_task,
+            // Remote access commands.
+            start_remote_server,
+            stop_remote_server,
+            get_remote_status,
+            get_remote_pin,
+            regenerate_remote_pin,
+            generate_qr_code,
+            broadcast_to_remote,
+            sync_state_to_remote,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -322,6 +557,10 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            // Initialize the remote server handle slot (server is OFF by default).
+            app.manage(Mutex::new(None::<ServerHandle>));
+
             Ok(())
         })
         .run(tauri::generate_context!())

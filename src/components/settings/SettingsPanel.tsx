@@ -1,7 +1,8 @@
-import { useState, useEffect, type CSSProperties } from "react";
+import { useState, useEffect, useCallback, type CSSProperties } from "react";
 import { readTextFile, writeTextFile, readFile, writeFile, exists, mkdir } from "@tauri-apps/plugin-fs";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import { useUiStore } from "@/store/ui-store";
 import { useTreeStore } from "@/store/tree-store";
 import { join } from "@/utils/paths";
@@ -436,6 +437,9 @@ export function SettingsPanel() {
           </>
         )}
 
+        {/* Remote Access */}
+        <RemoteAccessSection />
+
         {/* Advanced */}
         <div style={sectionStyle}>Advanced</div>
 
@@ -472,5 +476,239 @@ export function SettingsPanel() {
         </div>
       </div>
     </div>
+  );
+}
+
+// ─── Remote Access Section ─────────────────────────────────────────
+
+interface RemoteInfo {
+  url: string;
+  port: number;
+  ip: string;
+  pin: string;
+  certFingerprint: string;
+  qrDataUri?: string;
+}
+
+function RemoteAccessSection() {
+  const remoteConfig = useUiStore((s) => s.remoteConfig);
+  const remoteConnected = useUiStore((s) => s.remoteConnected);
+  const remoteClientCount = useUiStore((s) => s.remoteClientCount);
+  const setRemoteConfig = useUiStore((s) => s.setRemoteConfig);
+  const saveRemoteConfigFn = useUiStore((s) => s.saveRemoteConfig);
+  const connectRemote = useUiStore((s) => s.connectRemote);
+  const disconnectRemote = useUiStore((s) => s.disconnectRemote);
+  const projectPath = useTreeStore((s) => s.projectPath);
+
+  const saveRemoteConfig = useCallback(async () => {
+    if (projectPath) await saveRemoteConfigFn(projectPath);
+  }, [projectPath, saveRemoteConfigFn]);
+
+  const [remoteInfo, setRemoteInfo] = useState<RemoteInfo | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [serverRunning, setServerRunning] = useState(false);
+
+  const handleToggle = async (enabled: boolean) => {
+    setLoading(true);
+    setRemoteConfig({ enabled });
+    try {
+      if (enabled) {
+        const info = await invoke<RemoteInfo>("start_remote_server", {
+          port: remoteConfig.port,
+          exposeOnNetwork: remoteConfig.exposeOnNetwork,
+        });
+        // Generate QR code for the URL
+        try {
+          const qrDataUri = await invoke<string>("generate_qr_code", { url: info.url });
+          info.qrDataUri = qrDataUri;
+        } catch { /* QR optional */ }
+        setRemoteInfo(info);
+        setServerRunning(true);
+        connectRemote();
+      } else {
+        try { await invoke("stop_remote_server"); } catch { /* ignore */ }
+        disconnectRemote();
+        setRemoteInfo(null);
+        setServerRunning(false);
+      }
+    } catch (err) {
+      console.warn("[Settings] Remote server error:", err);
+      toast(err instanceof Error ? err.message : String(err), "error");
+      setRemoteConfig({ enabled: false });
+    }
+    await saveRemoteConfig();
+    setLoading(false);
+  };
+
+  const dotColor = serverRunning ? "#3fb950" : loading ? "#f0883e" : "#f85149";
+
+  return (
+    <>
+      <div style={sectionStyle}>Remote Access</div>
+
+      {/* Enable toggle */}
+      <label
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          cursor: "pointer",
+          marginBottom: 12,
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={remoteConfig.enabled}
+          onChange={(e) => handleToggle(e.target.checked)}
+          disabled={loading}
+          style={{ width: 16, height: 16, cursor: "pointer" }}
+        />
+        <span style={{ fontSize: 13, color: "var(--text-primary)" }}>
+          Enable remote access server
+        </span>
+      </label>
+
+      {remoteConfig.enabled && (
+        <div style={{ marginBottom: 16 }}>
+          {/* Connection status */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "8px 12px",
+              background: "rgba(74,158,255,0.06)",
+              border: "1px solid var(--border-color)",
+              borderRadius: 6,
+              marginBottom: 12,
+            }}
+          >
+            <span
+              style={{
+                width: 8,
+                height: 8,
+                borderRadius: "50%",
+                background: dotColor,
+                flexShrink: 0,
+              }}
+            />
+            <span style={{ fontSize: 12, color: "var(--text-primary)", flex: 1 }}>
+              {serverRunning
+                ? `Running${remoteClientCount > 0 ? ` \u00b7 ${remoteClientCount} client${remoteClientCount !== 1 ? "s" : ""}` : ""}`
+                : loading ? "Starting..." : "Stopped"}
+            </span>
+          </div>
+
+          {/* QR Code */}
+          {remoteInfo?.qrDataUri && (
+            <div
+              style={{
+                textAlign: "center",
+                marginBottom: 12,
+                padding: 12,
+                background: "#fff",
+                borderRadius: 8,
+              }}
+            >
+              <img
+                src={remoteInfo.qrDataUri}
+                alt="QR Code"
+                style={{ width: 180, height: 180, imageRendering: "pixelated" }}
+              />
+              <div style={{ fontSize: 11, color: "#333", marginTop: 6 }}>
+                Scan with your phone to connect
+              </div>
+            </div>
+          )}
+
+          {/* URL and PIN */}
+          {remoteInfo && (
+            <div style={{ marginBottom: 12 }}>
+              <label style={labelStyle}>Server URL</label>
+              <div
+                style={{
+                  ...inputStyle,
+                  fontSize: 12,
+                  fontFamily: "monospace",
+                  cursor: "pointer",
+                  userSelect: "all",
+                }}
+                onClick={() => {
+                  navigator.clipboard.writeText(remoteInfo.url);
+                  toast("URL copied", "success");
+                }}
+                title="Click to copy"
+              >
+                {remoteInfo.url}
+              </div>
+            </div>
+          )}
+
+          {remoteInfo?.pin && (
+            <div style={{ marginBottom: 12 }}>
+              <label style={labelStyle}>PIN Code</label>
+              <div
+                style={{
+                  fontSize: 28,
+                  fontWeight: 700,
+                  letterSpacing: "6px",
+                  color: "var(--accent-blue)",
+                  textAlign: "center",
+                  padding: "8px 0",
+                  fontFamily: "monospace",
+                }}
+              >
+                {remoteInfo.pin}
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-secondary)", textAlign: "center" }}>
+                Enter this PIN on your phone to authenticate
+              </div>
+            </div>
+          )}
+
+          {/* Port configuration */}
+          <div style={{ marginBottom: 8 }}>
+            <label style={labelStyle}>Port</label>
+            <input
+              type="number"
+              min={1024}
+              max={65535}
+              style={{ ...inputStyle, width: 100 }}
+              value={remoteConfig.port}
+              onChange={(e) => setRemoteConfig({ port: parseInt(e.target.value) || 5175 })}
+              onBlur={saveRemoteConfig}
+            />
+          </div>
+
+          {/* Network exposure toggle */}
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              cursor: "pointer",
+              marginBottom: 8,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={remoteConfig.exposeOnNetwork}
+              onChange={(e) => {
+                setRemoteConfig({ exposeOnNetwork: e.target.checked });
+                saveRemoteConfig();
+              }}
+              style={{ width: 14, height: 14, cursor: "pointer" }}
+            />
+            <span style={{ fontSize: 12, color: "var(--text-primary)" }}>
+              Expose on local network (0.0.0.0)
+            </span>
+          </label>
+          <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>
+            When disabled, only accessible from this machine (127.0.0.1).
+            Enable to allow connections from other devices on your LAN.
+          </div>
+        </div>
+      )}
+    </>
   );
 }
