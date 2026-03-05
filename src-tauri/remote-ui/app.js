@@ -611,7 +611,7 @@ function renderConnect() {
       <div style="margin-bottom:16px">
         <input class="room-code-input" id="room-code-input" type="text"
           placeholder="ATM-XXXXXX" maxlength="10" autocomplete="off"
-          autocorrect="off" spellcheck="false" autocapitalize="off"
+          inputmode="text" autocorrect="off" spellcheck="false" autocapitalize="characters"
           style="font-size:24px;text-align:center;letter-spacing:4px;padding:12px 16px;width:100%;box-sizing:border-box;background:var(--bg-card);border:2px solid var(--border);border-radius:12px;color:var(--text);font-family:monospace;"
           value="${esc(state.roomCode || '')}">
       </div>
