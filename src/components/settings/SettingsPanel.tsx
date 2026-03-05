@@ -567,7 +567,7 @@ function RemoteAccessSection() {
         // Generate QR code with relay info — read fresh state after await
         const status = useUiStore.getState().relayStatus;
         if (status.roomCode) {
-          const qrContent = `https://atm.datafying.com?code=${status.roomCode}&relay=${encodeURIComponent(remoteConfig.relayUrl)}`;
+          const qrContent = `https://atm.datafying.tech?code=${status.roomCode}&relay=${encodeURIComponent(remoteConfig.relayUrl)}`;
           try {
             const qrDataUri = await invoke<string>("generate_qr_code", { url: qrContent });
             setRemoteInfo({
@@ -886,10 +886,10 @@ function RemoteAccessSection() {
                     value={remoteConfig.relayUrl}
                     onChange={(e) => setRemoteConfig({ relayUrl: e.target.value })}
                     onBlur={saveRemoteConfig}
-                    placeholder="wss://atm-relay.datafying.com"
+                    placeholder="wss://atm-relay.datafying.tech"
                   />
                   <div style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: 4 }}>
-                    Self-host the relay server for full control. Default: wss://atm-relay.datafying.com
+                    Self-host the relay server for full control. Default: wss://atm-relay.datafying.tech
                   </div>
                 </div>
               )}

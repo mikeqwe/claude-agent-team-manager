@@ -646,7 +646,7 @@ function handleConnectRelay() {
 
   state.relayMode = true;
   state.roomCode = code;
-  state.relayUrl = state.relayUrl || 'wss://atm-relay.datafying.com';
+  state.relayUrl = state.relayUrl || 'wss://atm-relay.datafying.tech';
 
   if (!state.relayUrl.startsWith('wss://')) {
     state.authError = 'Invalid relay URL: only secure (wss://) connections are allowed';
@@ -1503,7 +1503,7 @@ function init() {
 
   if (relayCode) {
     // QR code scanned - go directly to connecting
-    const resolvedRelayUrl = relayUrlParam || 'wss://atm-relay.datafying.com';
+    const resolvedRelayUrl = relayUrlParam || 'wss://atm-relay.datafying.tech';
     if (!resolvedRelayUrl.startsWith('wss://')) {
       state.screen = 'connect';
       state.authError = 'Invalid relay URL: only secure (wss://) connections are allowed';

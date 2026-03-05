@@ -298,7 +298,7 @@ class RemoteSyncService {
    * Initialize LAN mode: listen for Tauri events from the Rust server.
    */
   async init(): Promise<void> {
-    if (this._unlisteners.length > 0) return;
+    if (this._unlisteners.length > 0) this.dispose();
     this._mode = "lan";
 
     const u1 = await listen<{ port: number; url: string; pin: string }>(

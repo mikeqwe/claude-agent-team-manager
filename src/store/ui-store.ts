@@ -299,7 +299,7 @@ export const useUiStore = create<UiStore>()((set, get) => ({
     }
   },
 
-  connectRemote() {
+  async connectRemote() {
     // Listen for connection changes from the sync service
     const unsub = remoteSync.onConnectionChange((connected, clientCount) => {
       set({ remoteConnected: connected, remoteClientCount: clientCount });
@@ -307,7 +307,7 @@ export const useUiStore = create<UiStore>()((set, get) => ({
     unsubscribers.push(unsub);
 
     // Initialize Tauri event listeners for server started/stopped events
-    remoteSync.init();
+    await remoteSync.init();
 
     // Register tree-store push/reconnect handlers so mobile get_tree requests work
     const unsubTree = useTreeStore.getState().initRemoteSync();
@@ -330,6 +330,7 @@ export const useUiStore = create<UiStore>()((set, get) => ({
       });
     } catch (err) {
       console.warn("[ATM] Failed to connect to relay:", err);
+      remoteSync.dispose();
       throw err;
     }
 

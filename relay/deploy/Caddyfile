@@ -1,4 +1,4 @@
-atm-relay.datafying.com {
+atm-relay.datafying.tech {
     reverse_proxy localhost:8080
 
     # WebSocket support
@@ -13,6 +13,7 @@ atm-relay.datafying.com {
         X-Content-Type-Options nosniff
         X-Frame-Options DENY
         Referrer-Policy no-referrer
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
     }
 
     log {

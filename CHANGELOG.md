@@ -1,5 +1,27 @@
 # ATM (Agent Team Manager) — Changelog
 
+## v0.8.3 — March 5, 2026
+
+### Production-Ready Remote Access
+
+**Cloud Relay Deployment:**
+- **Relay server deployed** — cloud relay now live at `wss://atm-relay.datafying.tech` on Linode (Ubuntu 22.04), fronted by Caddy with automatic TLS
+- **Domain switch** — migrated from `atm-relay.datafying.com` (CloudFront, broken) to `atm-relay.datafying.tech` (direct DNS to Linode)
+- **systemd hardening** — relay runs as dedicated `atm-relay` user with NoNewPrivileges, ProtectSystem=strict, MemoryMax=500M
+- **Caddy reverse proxy** — automatic HTTPS certificate provisioning, WebSocket upgrade handling, security headers
+
+**Bug Fixes:**
+- **LAN mobile skeleton loading** — `initRemoteSync()` was never called on LAN connect; mobile clients now receive tree data immediately after PIN auth
+- **Domain references updated** — all hardcoded `.datafying.com` URLs replaced with `.datafying.tech` across desktop, mobile client, and relay config
+
+**QA:**
+- Full TypeScript compilation check (`tsc --noEmit`) — zero errors
+- Rust compilation check (`cargo check`) — both `src-tauri/` and `relay/` pass
+- Cloud E2E verified: desktop → relay → mobile with PIN auth and encrypted sync
+- LAN E2E verified: desktop → mobile on same network with real-time updates
+
+---
+
 ## v0.8.2 — March 5, 2026
 
 ### Security Hotfix: Cloud Relay Hardening

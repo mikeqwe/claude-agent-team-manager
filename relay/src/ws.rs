@@ -9,7 +9,7 @@ use tokio::time::{timeout, Duration};
 
 use crate::config::Config;
 use crate::rate_limit::RateLimitState;
-use crate::room::RoomManager;
+use crate::room::{redact_code, RoomManager};
 
 /// Shared application state threaded through axum handlers.
 pub struct AppState {
@@ -160,7 +160,7 @@ async fn handle_desktop(
         return;
     }
 
-    log::info!("Desktop {} created room {}", addr, room_code);
+    log::info!("Desktop {} created room {}", addr, redact_code(&room_code));
 
     // Enter the bidirectional relay loop.
     relay_loop(state, &room_code, conn_id, true, socket, desktop_rx).await;
@@ -172,7 +172,7 @@ async fn handle_desktop(
         let _ = mobile_tx.try_send(Message::Close(None));
     }
     state.room_manager.remove_room(&room_code);
-    log::info!("Room {} removed (desktop disconnected)", room_code);
+    log::info!("Room {} removed (desktop disconnected)", redact_code(&room_code));
 }
 
 // ---- Mobile flow ----
@@ -223,7 +223,7 @@ async fn handle_mobile(
         return;
     }
 
-    log::info!("Mobile {} joined room {}", addr, room_code);
+    log::info!("Mobile {} joined room {}", addr, redact_code(&room_code));
 
     // Enter the bidirectional relay loop.
     relay_loop(state, &room_code, conn_id, false, socket, mobile_rx).await;
@@ -235,7 +235,7 @@ async fn handle_mobile(
         let _ = desktop_tx.try_send(Message::Close(None));
     }
     state.room_manager.remove_room(&room_code);
-    log::info!("Room {} removed (mobile disconnected)", room_code);
+    log::info!("Room {} removed (mobile disconnected)", redact_code(&room_code));
 }
 
 // ---- Relay loop ----

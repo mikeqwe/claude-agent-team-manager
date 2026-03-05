@@ -30,7 +30,7 @@ export type RemoteConfig = z.infer<typeof RemoteConfigSchema>;
 
 export type RemoteAccessMode = "lan" | "cloud";
 
-export const DEFAULT_RELAY_URL = "wss://atm-relay.datafying.com";
+export const DEFAULT_RELAY_URL = "wss://atm-relay.datafying.tech";
 
 export const REMOTE_CONFIG_DEFAULTS: RemoteConfig = {
   enabled: false,
