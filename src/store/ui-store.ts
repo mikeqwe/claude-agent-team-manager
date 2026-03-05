@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { REMOTE_CONFIG_DEFAULTS, type RemoteConfig } from "@/types/remote";
+import type { RelayStatus } from "@/types/remote";
 import { remoteSync } from "@/services/remote-sync";
 
 interface RemoteState {
@@ -9,6 +10,8 @@ interface RemoteState {
   remoteConnected: boolean;
   /** Number of mobile clients currently connected */
   remoteClientCount: number;
+  /** Cloud relay connection status */
+  relayStatus: RelayStatus;
 }
 
 interface UiState {
@@ -43,6 +46,12 @@ interface RemoteActions {
   connectRemote(): void;
   /** Stop the desktop WebSocket connection. */
   disconnectRemote(): void;
+  /** Connect to cloud relay and create a room. */
+  connectRelay(relayUrl: string): Promise<void>;
+  /** Disconnect from cloud relay. */
+  disconnectRelay(): void;
+  /** Update relay status (called from event listeners). */
+  setRelayStatus(updates: Partial<RelayStatus>): void;
 }
 
 interface UiActions {
@@ -99,6 +108,12 @@ export const useUiStore = create<UiStore>()((set, get) => ({
   remoteConfig: { ...DEFAULT_REMOTE_CONFIG },
   remoteConnected: false,
   remoteClientCount: 0,
+  relayStatus: {
+    connected: false,
+    roomCode: null,
+    clientConnected: false,
+    publicKey: null,
+  },
 
   selectNode(id: string | null) {
     if (id !== null) {
@@ -293,5 +308,50 @@ export const useUiStore = create<UiStore>()((set, get) => ({
   disconnectRemote() {
     remoteSync.dispose();
     set({ remoteConnected: false, remoteClientCount: 0 });
+  },
+
+  async connectRelay(relayUrl: string) {
+    try {
+      const status = await remoteSync.initRelay(relayUrl);
+      set({
+        remoteConnected: true,
+        relayStatus: status,
+      });
+    } catch (err) {
+      console.warn("[ATM] Failed to connect to relay:", err);
+      throw err;
+    }
+
+    remoteSync.onConnectionChange((connected, clientCount) => {
+      set({
+        remoteConnected: connected,
+        remoteClientCount: clientCount,
+        relayStatus: {
+          ...get().relayStatus,
+          connected,
+          clientConnected: clientCount > 0,
+        },
+      });
+    });
+  },
+
+  disconnectRelay() {
+    remoteSync.dispose();
+    set({
+      remoteConnected: false,
+      remoteClientCount: 0,
+      relayStatus: {
+        connected: false,
+        roomCode: null,
+        clientConnected: false,
+        publicKey: null,
+      },
+    });
+  },
+
+  setRelayStatus(updates: Partial<RelayStatus>) {
+    set((state) => ({
+      relayStatus: { ...state.relayStatus, ...updates },
+    }));
   },
 }));

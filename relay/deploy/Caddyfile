@@ -1,0 +1,22 @@
+atm-relay.datafying.com {
+    reverse_proxy localhost:8080
+
+    # WebSocket support
+    @websocket {
+        header Connection *Upgrade*
+        header Upgrade    websocket
+    }
+    reverse_proxy @websocket localhost:8080
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy no-referrer
+    }
+
+    log {
+        output file /var/log/caddy/atm-relay.log
+        format json
+    }
+}

@@ -1,10 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import nacl from "tweetnacl";
+import { encodeBase64, decodeBase64 } from "tweetnacl-util";
 import type { AuiNode } from "@/types/aui-node";
 import type {
   RedactedRemoteNode,
   RemoteMessage,
   ServerEventType,
+  EncryptedEnvelope,
+  RelayStatus,
 } from "@/types/remote";
 import { redactNode } from "@/types/remote";
 
@@ -43,6 +47,100 @@ export function serializeNodes(nodes: Map<string, AuiNode>): RedactedRemoteNode[
   return result;
 }
 
+// ── E2E Crypto Session ───────────────────────────────
+
+/**
+ * Manages X25519 key exchange and XSalsa20-Poly1305 authenticated encryption.
+ * Used in cloud relay mode to ensure the relay never sees plaintext.
+ *
+ * Nonce space is partitioned by role to prevent collisions: desktop uses
+ * prefix byte 0x01, mobile uses 0x02.  Both sides start their counter at 0
+ * but will never produce identical nonces because the first byte differs.
+ */
+export class CryptoSession {
+  private keyPair: nacl.BoxKeyPair;
+  private sharedKey: Uint8Array | null = null;
+  /** Counter-based nonce for sending (incremented per message) */
+  private sendNonce: number = 0;
+  /** Role prefix byte: 0x01 = desktop, 0x02 = mobile */
+  private readonly rolePrefix: number;
+
+  constructor(role: "desktop" | "mobile" = "desktop") {
+    this.keyPair = nacl.box.keyPair();
+    this.rolePrefix = role === "desktop" ? 0x01 : 0x02;
+  }
+
+  /** Base64-encoded public key to share with the peer */
+  get publicKeyBase64(): string {
+    return encodeBase64(this.keyPair.publicKey);
+  }
+
+  /** Whether a shared secret has been derived (peer key received) */
+  get isPaired(): boolean {
+    return this.sharedKey !== null;
+  }
+
+  /**
+   * Derive the shared secret from the peer's public key.
+   * After this, encrypt() and decrypt() can be used.
+   */
+  deriveSharedKey(peerPublicKeyBase64: string): void {
+    const peerPublicKey = decodeBase64(peerPublicKeyBase64);
+    this.sharedKey = nacl.box.before(peerPublicKey, this.keyPair.secretKey);
+  }
+
+  /**
+   * Encrypt a RemoteMessage into an EncryptedEnvelope.
+   * Uses counter-based nonces to prevent reuse.
+   */
+  encrypt(message: RemoteMessage): EncryptedEnvelope {
+    if (!this.sharedKey) throw new Error("CryptoSession not paired");
+
+    const plaintext = new TextEncoder().encode(JSON.stringify(message));
+    const nonce = this.makeNonce(this.sendNonce++);
+    const ciphertext = nacl.secretbox(plaintext, nonce, this.sharedKey);
+
+    if (!ciphertext) throw new Error("Encryption failed");
+
+    return {
+      type: "encrypted",
+      nonce: encodeBase64(nonce),
+      ciphertext: encodeBase64(ciphertext),
+    };
+  }
+
+  /**
+   * Decrypt an EncryptedEnvelope back into a RemoteMessage.
+   */
+  decrypt(envelope: EncryptedEnvelope): RemoteMessage | null {
+    if (!this.sharedKey) throw new Error("CryptoSession not paired");
+
+    const nonce = decodeBase64(envelope.nonce);
+    const ciphertext = decodeBase64(envelope.ciphertext);
+    const plaintext = nacl.secretbox.open(ciphertext, nonce, this.sharedKey);
+
+    if (!plaintext) {
+      console.warn("[CryptoSession] Decryption failed — invalid ciphertext or nonce");
+      return null;
+    }
+
+    return JSON.parse(new TextDecoder().decode(plaintext)) as RemoteMessage;
+  }
+
+  /** Build a 24-byte nonce from a counter value, prefixed by role byte */
+  private makeNonce(counter: number): Uint8Array {
+    const nonce = new Uint8Array(24);
+    // Byte 0: role prefix (0x01 desktop, 0x02 mobile) to prevent collisions
+    nonce[0] = this.rolePrefix;
+    // Write counter as big-endian in the last 8 bytes
+    const view = new DataView(nonce.buffer);
+    // Use two 32-bit writes for the 64-bit counter space
+    view.setUint32(16, Math.floor(counter / 0x100000000), false);
+    view.setUint32(20, counter >>> 0, false);
+    return nonce;
+  }
+}
+
 // ── Remote Sync Service ──────────────────────────────
 
 type PushHandler = (msg: RemoteMessage) => void;
@@ -53,9 +151,17 @@ type ConnectionHandler = (connected: boolean, clientCount: number) => void;
  * Tauri commands and events (NOT WebSocket -- the desktop communicates
  * with the Rust backend via IPC, not over the network).
  *
- * Communication flow:
+ * Supports two modes:
+ * - LAN mode: Direct local server (existing behavior)
+ * - Cloud mode: Via relay server with E2E encryption
+ *
+ * Communication flow (LAN):
  *   Local store change -> broadcastEvent() -> invoke("broadcast_to_remote") -> Rust bridge -> WS fan-out to mobiles
  *   Mobile command -> WS -> Rust bridge -> Tauri event ("remote:request-sync") -> onPush handler -> local store
+ *
+ * Communication flow (Cloud):
+ *   Local store change -> broadcastEvent() -> encrypt -> invoke("send_to_relay") -> relay -> mobile
+ *   Mobile command -> relay -> Tauri event ("relay:message") -> decrypt -> onPush handler -> local store
  */
 class RemoteSyncService {
   private pushHandlers: Set<PushHandler> = new Set();
@@ -68,12 +174,38 @@ class RemoteSyncService {
   /** Cleanup functions for all Tauri event listeners. */
   private _unlisteners: Array<() => void> = [];
 
+  /** Current operating mode */
+  private _mode: "lan" | "cloud" = "lan";
+
+  /** E2E crypto session (cloud mode only) */
+  private _crypto: CryptoSession | null = null;
+
+  /** Relay connection status */
+  private _relayStatus: RelayStatus = {
+    connected: false,
+    roomCode: null,
+    clientConnected: false,
+    publicKey: null,
+  };
+
   get connected(): boolean {
     return this._connected;
   }
 
   get clientCount(): number {
     return this._clientCount;
+  }
+
+  get mode(): "lan" | "cloud" {
+    return this._mode;
+  }
+
+  get relayStatus(): RelayStatus {
+    return { ...this._relayStatus };
+  }
+
+  get cryptoSession(): CryptoSession | null {
+    return this._crypto;
   }
 
   /** Check and consume the remote-origin flag (prevents echo loops). */
@@ -109,31 +241,54 @@ class RemoteSyncService {
   }
 
   /**
-   * Broadcast a server event to all connected remote clients via the Rust bridge.
-   * No-op if the server is not running.
+   * Broadcast a server event to all connected remote clients.
+   * In LAN mode: via Rust bridge. In cloud mode: encrypted via relay.
+   * No-op if not connected.
    */
   broadcastEvent(type: ServerEventType, payload: unknown): void {
     if (!this._connected) return;
 
-    invoke("broadcast_to_remote", {
-      eventType: type,
-      payload,
-    }).catch((err) => {
-      console.warn("[RemoteSync] Failed to broadcast:", err);
-    });
+    if (this._mode === "cloud") {
+      this.broadcastViaRelay(type, payload);
+    } else {
+      invoke("broadcast_to_remote", {
+        eventType: type,
+        payload,
+      }).catch((err) => {
+        console.warn("[RemoteSync] Failed to broadcast:", err);
+      });
+    }
   }
 
   /**
-   * Initialize: listen for Tauri events from the Rust server.
-   *
-   * Events handled:
-   * - "remote-server-started" — server is up, mark connected
-   * - "remote-server-stopped" — server is down, mark disconnected
-   * - "remote:request-sync" — mobile client requested full tree, forward to push handlers
-   * - "remote:request-node" — mobile client requested a specific node
+   * Encrypt and send a message through the relay (cloud mode).
+   */
+  private broadcastViaRelay(type: ServerEventType, payload: unknown): void {
+    if (!this._crypto?.isPaired) return;
+
+    const msg: RemoteMessage = {
+      type,
+      id: crypto.randomUUID(),
+      payload,
+      timestamp: Date.now(),
+    };
+
+    try {
+      const envelope = this._crypto.encrypt(msg);
+      invoke("send_to_relay", { data: JSON.stringify(envelope) }).catch((err) => {
+        console.warn("[RemoteSync] Failed to send via relay:", err);
+      });
+    } catch (err) {
+      console.warn("[RemoteSync] Encryption failed:", err);
+    }
+  }
+
+  /**
+   * Initialize LAN mode: listen for Tauri events from the Rust server.
    */
   async init(): Promise<void> {
     if (this._unlisteners.length > 0) return;
+    this._mode = "lan";
 
     const u1 = await listen<{ port: number; url: string; pin: string }>(
       "remote-server-started",
@@ -142,7 +297,6 @@ class RemoteSyncService {
         this._connected = true;
         this.notifyConnectionChange();
 
-        // Fire reconnect handlers to push full state
         for (const handler of this.reconnectHandlers) {
           try {
             handler();
@@ -160,7 +314,6 @@ class RemoteSyncService {
       this.notifyConnectionChange();
     });
 
-    // Bridge event: mobile client requested full tree sync
     const u3 = await listen("remote:request-sync", () => {
       const msg: RemoteMessage = {
         type: "get_tree",
@@ -177,7 +330,6 @@ class RemoteSyncService {
       }
     });
 
-    // Bridge event: mobile client requested a specific node
     const u4 = await listen<{ id: string }>("remote:request-node", (event) => {
       const nodeId = event.payload?.id;
       if (!nodeId) return;
@@ -200,6 +352,110 @@ class RemoteSyncService {
   }
 
   /**
+   * Initialize cloud relay mode: connect to relay and create a room.
+   */
+  async initRelay(relayUrl: string): Promise<RelayStatus> {
+    if (this._unlisteners.length > 0) this.dispose();
+    this._mode = "cloud";
+
+    // Create crypto session
+    this._crypto = new CryptoSession();
+    this._relayStatus = {
+      connected: false,
+      roomCode: null,
+      clientConnected: false,
+      publicKey: this._crypto.publicKeyBase64,
+    };
+
+    // Listen for relay events from Rust backend
+    const u1 = await listen<{ room_code: string }>("relay:room-created", (event) => {
+      console.log("[RemoteSync] Relay room created:", event.payload.room_code);
+      this._relayStatus.roomCode = event.payload.room_code;
+      this._relayStatus.connected = true;
+      this._connected = true;
+      this.notifyConnectionChange();
+    });
+
+    const u2 = await listen<{ mobile_public_key: string }>("relay:peer-joined", (event) => {
+      console.log("[RemoteSync] Peer joined relay room");
+      if (this._crypto) {
+        this._crypto.deriveSharedKey(event.payload.mobile_public_key);
+      }
+      this._relayStatus.clientConnected = true;
+      this._clientCount = 1;
+      this.notifyConnectionChange();
+
+      // Fire reconnect handlers to push full state
+      for (const handler of this.reconnectHandlers) {
+        try {
+          handler();
+        } catch (err) {
+          console.warn("[RemoteSync] Reconnect handler error:", err);
+        }
+      }
+    });
+
+    const u3 = await listen("relay:peer-disconnected", () => {
+      console.log("[RemoteSync] Peer disconnected from relay");
+      this._relayStatus.clientConnected = false;
+      this._clientCount = 0;
+      this.notifyConnectionChange();
+    });
+
+    const u4 = await listen("relay:disconnected", () => {
+      console.log("[RemoteSync] Disconnected from relay");
+      this._connected = false;
+      this._relayStatus.connected = false;
+      this._relayStatus.clientConnected = false;
+      this._clientCount = 0;
+      this.notifyConnectionChange();
+    });
+
+    // Handle encrypted messages from mobile via relay
+    const u5 = await listen<{ data: string }>("relay:message", (event) => {
+      if (!this._crypto?.isPaired) return;
+
+      try {
+        const envelope = JSON.parse(event.payload.data) as EncryptedEnvelope;
+        if (envelope.type !== "encrypted") return;
+
+        const msg = this._crypto.decrypt(envelope);
+        if (!msg) return;
+
+        for (const handler of this.pushHandlers) {
+          try {
+            handler(msg);
+          } catch (err) {
+            console.warn("[RemoteSync] Push handler error:", err);
+          }
+        }
+      } catch (err) {
+        console.warn("[RemoteSync] Failed to process relay message:", err);
+      }
+    });
+
+    this._unlisteners.push(u1, u2, u3, u4, u5);
+
+    // Connect to relay and create room
+    try {
+      const result = await invoke<{ room_code: string }>("connect_to_relay", {
+        relayUrl,
+        publicKey: this._crypto.publicKeyBase64,
+      });
+      this._relayStatus.roomCode = result.room_code;
+      this._relayStatus.connected = true;
+      this._connected = true;
+      this.notifyConnectionChange();
+    } catch (err) {
+      console.warn("[RemoteSync] Failed to connect to relay:", err);
+      this._relayStatus.connected = false;
+      throw err;
+    }
+
+    return { ...this._relayStatus };
+  }
+
+  /**
    * Push the full app state to the Rust shared state so the REST API
    * and new WebSocket clients can access it.
    */
@@ -208,6 +464,17 @@ class RemoteSyncService {
     layouts: unknown,
     settings: unknown,
   ): Promise<void> {
+    if (this._mode === "cloud") {
+      // In cloud mode, send full_sync via encrypted relay
+      const remoteNodes: RedactedRemoteNode[] = [];
+      for (const node of nodes.values()) {
+        remoteNodes.push(nodeToRemote(node));
+      }
+      this.broadcastEvent("full_sync", { nodes: remoteNodes, metadata: {} });
+      return;
+    }
+
+    // LAN mode: push to Rust shared state
     const nodesObj: Record<string, RedactedRemoteNode> = {};
     for (const [id, node] of nodes) {
       nodesObj[id] = nodeToRemote(node);
@@ -223,8 +490,20 @@ class RemoteSyncService {
 
   /** Tear down the service and clean up all resources. */
   dispose(): void {
+    // If in cloud mode, disconnect from relay
+    if (this._mode === "cloud") {
+      invoke("disconnect_from_relay").catch(() => {});
+    }
+
     this._connected = false;
     this._clientCount = 0;
+    this._crypto = null;
+    this._relayStatus = {
+      connected: false,
+      roomCode: null,
+      clientConnected: false,
+      publicKey: null,
+    };
     this.pushHandlers.clear();
     this.connectionHandlers.clear();
     this.reconnectHandlers.clear();

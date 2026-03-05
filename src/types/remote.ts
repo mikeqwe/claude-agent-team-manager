@@ -9,8 +9,10 @@ import { SettingsConfigSchema } from "./settings";
 
 export const RemoteConfigSchema = z.object({
   enabled: z.boolean(),
+  /** Remote access mode: 'lan' for direct local server, 'cloud' for relay */
+  mode: z.enum(["lan", "cloud"]),
   port: z.number().int().min(1024).max(65535),
-  /** Bind to 0.0.0.0 (true) or 127.0.0.1 (false) */
+  /** Bind to 0.0.0.0 (true) or 127.0.0.1 (false) — LAN mode only */
   exposeOnNetwork: z.boolean(),
   /** Token expiry in hours (default 24) */
   tokenExpiryHours: z.number().int().min(1),
@@ -20,18 +22,26 @@ export const RemoteConfigSchema = z.object({
   allowEdits: z.boolean(),
   /** Auto-stop server after N minutes of inactivity (0 = never) */
   idleTimeoutMinutes: z.number().int().min(0),
+  /** Cloud relay server URL */
+  relayUrl: z.string(),
 });
 
 export type RemoteConfig = z.infer<typeof RemoteConfigSchema>;
 
+export type RemoteAccessMode = "lan" | "cloud";
+
+export const DEFAULT_RELAY_URL = "wss://atm-relay.datafying.com";
+
 export const REMOTE_CONFIG_DEFAULTS: RemoteConfig = {
   enabled: false,
+  mode: "lan",
   port: 5175,
   exposeOnNetwork: false,
   tokenExpiryHours: 24,
   maxSessions: 3,
   allowEdits: true,
   idleTimeoutMinutes: 0,
+  relayUrl: DEFAULT_RELAY_URL,
 };
 
 // ---------------------------------------------------------------------------
@@ -401,4 +411,84 @@ export function buildServerMessage<K extends ServerEventType>(
   payload: ServerEventPayloads[K],
 ): RemoteMessage {
   return { type, id, payload, timestamp: Date.now() };
+}
+
+// ---------------------------------------------------------------------------
+// Cloud Relay Protocol Types
+// ---------------------------------------------------------------------------
+
+/** Message sent by desktop to relay to create a room */
+export interface CreateRoomMessage {
+  type: "create_room";
+  desktop_public_key: string; // base64-encoded X25519 public key
+}
+
+/** Response from relay after room creation */
+export interface RoomCreatedMessage {
+  type: "room_created";
+  room_code: string; // e.g. "ATM-X7K3mP"
+}
+
+/** Message sent by mobile to relay to join a room */
+export interface JoinRoomMessage {
+  type: "join_room";
+  room_code: string;
+  mobile_public_key: string; // base64-encoded X25519 public key
+}
+
+/** Sent to desktop when mobile joins */
+export interface PeerJoinedMessage {
+  type: "peer_joined";
+  mobile_public_key: string; // base64-encoded X25519 public key
+}
+
+/** Sent to mobile after joining with desktop's key */
+export interface RoomJoinedMessage {
+  type: "room_joined";
+  desktop_public_key: string; // base64-encoded X25519 public key
+}
+
+/** Relay error message */
+export interface RelayErrorMessage {
+  type: "relay_error";
+  code: string;
+  message: string;
+}
+
+/** Peer disconnected notification */
+export interface PeerDisconnectedMessage {
+  type: "peer_disconnected";
+}
+
+export type RelayProtocolMessage =
+  | CreateRoomMessage
+  | RoomCreatedMessage
+  | JoinRoomMessage
+  | PeerJoinedMessage
+  | RoomJoinedMessage
+  | RelayErrorMessage
+  | PeerDisconnectedMessage;
+
+// ---------------------------------------------------------------------------
+// E2E Encryption Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Encrypted message envelope sent over the relay.
+ * The relay cannot read the contents — it just forwards the blob.
+ */
+export interface EncryptedEnvelope {
+  type: "encrypted";
+  /** Base64-encoded 24-byte nonce */
+  nonce: string;
+  /** Base64-encoded ciphertext (XSalsa20-Poly1305) */
+  ciphertext: string;
+}
+
+/** Relay connection status */
+export interface RelayStatus {
+  connected: boolean;
+  roomCode: string | null;
+  clientConnected: boolean;
+  publicKey: string | null;
 }

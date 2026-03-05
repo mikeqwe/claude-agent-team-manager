@@ -1,6 +1,6 @@
 [package]
 name = "atm"
-version = "0.8.0"
+version = "0.8.1"
 description = "ATM — Agent Team Manager for Claude Code"
 authors = ["Kevin"]
 license = "MIT"
@@ -41,3 +41,6 @@ uuid = { version = "1", features = ["v4"] }
 qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
+
+# Cloud relay client
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }

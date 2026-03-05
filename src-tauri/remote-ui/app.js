@@ -18,7 +18,7 @@ const Icons = {
 
 // ─── Application State ─────────────────────────────────────────
 const state = {
-  screen: 'auth',       // 'auth' | 'tree' | 'detail'
+  screen: 'auth',       // 'connect' | 'auth' | 'tree' | 'detail'
   prevScreen: null,
   ws: null,
   token: null,
@@ -42,6 +42,15 @@ const state = {
   latencyMs: 0,
   reconnectTimer: null,
   lockoutTimer: null,
+  // Cloud relay mode
+  relayMode: false,
+  roomCode: null,
+  relayUrl: null,
+  // E2E crypto
+  keyPair: null,
+  sharedKey: null,
+  peerPublicKey: null,
+  sendNonce: 0,
 };
 
 // ─── Constants ─────────────────────────────────────────────────
@@ -66,6 +75,76 @@ const KIND_LABELS = {
 const SENSITIVE_VAR_TYPES = ['api-key', 'api_key', 'apikey', 'password', 'secret', 'token'];
 const RECONNECT_DELAY = 3000;
 const PING_INTERVAL = 30000;
+
+// ─── E2E Crypto Helpers ──────────────────────────────────────
+function initCrypto() {
+  if (typeof nacl === 'undefined') {
+    console.warn('tweetnacl not loaded, encryption unavailable');
+    return;
+  }
+  state.keyPair = nacl.box.keyPair();
+  state.sendNonce = 0;
+}
+
+function deriveSharedKey(peerPublicKeyBase64) {
+  if (!state.keyPair) return;
+  const peerKey = base64ToUint8(peerPublicKeyBase64);
+  state.sharedKey = nacl.box.before(peerKey, state.keyPair.secretKey);
+}
+
+function encryptMessage(msg) {
+  if (!state.sharedKey) return JSON.stringify(msg);
+  const plaintext = new TextEncoder().encode(JSON.stringify(msg));
+  const nonce = makeNonce(state.sendNonce++);
+  const ciphertext = nacl.secretbox(plaintext, nonce, state.sharedKey);
+  return JSON.stringify({
+    type: 'encrypted',
+    nonce: uint8ToBase64(nonce),
+    ciphertext: uint8ToBase64(ciphertext),
+  });
+}
+
+function decryptMessage(data) {
+  try {
+    const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+    if (parsed.type !== 'encrypted') return parsed;
+    if (!state.sharedKey) return null;
+    const nonce = base64ToUint8(parsed.nonce);
+    const ciphertext = base64ToUint8(parsed.ciphertext);
+    const plaintext = nacl.secretbox.open(ciphertext, nonce, state.sharedKey);
+    if (!plaintext) { console.warn('Decryption failed'); return null; }
+    return JSON.parse(new TextDecoder().decode(plaintext));
+  } catch (err) {
+    console.warn('Failed to decrypt:', err);
+    return null;
+  }
+}
+
+function makeNonce(counter) {
+  const nonce = new Uint8Array(24);
+  // Byte 0: role prefix (0x02 = mobile, 0x01 = desktop) to prevent collisions
+  nonce[0] = 0x02;
+  const view = new DataView(nonce.buffer);
+  view.setUint32(16, Math.floor(counter / 0x100000000), false);
+  view.setUint32(20, counter >>> 0, false);
+  return nonce;
+}
+
+function uint8ToBase64(arr) {
+  return btoa(String.fromCharCode.apply(null, arr));
+}
+
+function base64ToUint8(str) {
+  const bin = atob(str);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
+}
+
+function getPublicKeyBase64() {
+  if (!state.keyPair) return '';
+  return uint8ToBase64(state.keyPair.publicKey);
+}
 
 // ─── Toast System ──────────────────────────────────────────────
 function showToast(message, type = 'info', duration = 3000) {
@@ -97,33 +176,39 @@ async function authenticate(pin) {
   render();
 
   try {
-    const res = await fetch('/api/auth', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pin }),
-    });
-    const data = await res.json();
-
-    if (data.ok) {
-      state.token = data.token;
-      state.sessionId = data.sessionId;
-      state.screen = 'tree';
-      state.prevScreen = 'auth';
-      state.loadingTree = true;
-      state.authError = null;
-      state.authLocked = false;
-      history.pushState({ screen: 'tree' }, '');
-      connectWebSocket();
+    if (state.relayMode) {
+      // In relay mode, send PIN via encrypted WebSocket
+      sendMessage('auth', { pin });
+      // Wait for auth_ok/auth_fail via WebSocket message
+      // The handleServerMessage will handle the response
     } else {
-      state.authError = data.error || 'Authentication failed';
-      // Check for lockout
-      if (res.status === 429) {
-        state.authLocked = true;
-        // Parse seconds from error message
-        const match = data.error && data.error.match(/(\d+)\s*seconds?/);
-        if (match) {
-          state.authLockSeconds = parseInt(match[1], 10);
-          startLockoutTimer();
+      // LAN mode: REST API auth
+      const res = await fetch('/api/auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin }),
+      });
+      const data = await res.json();
+
+      if (data.ok) {
+        state.token = data.token;
+        state.sessionId = data.sessionId;
+        state.screen = 'tree';
+        state.prevScreen = 'auth';
+        state.loadingTree = true;
+        state.authError = null;
+        state.authLocked = false;
+        history.pushState({ screen: 'tree' }, '');
+        connectWebSocket();
+      } else {
+        state.authError = data.error || 'Authentication failed';
+        if (res.status === 429) {
+          state.authLocked = true;
+          const match = data.error && data.error.match(/(\d+)\s*seconds?/);
+          if (match) {
+            state.authLockSeconds = parseInt(match[1], 10);
+            startLockoutTimer();
+          }
         }
       }
     }
@@ -156,23 +241,84 @@ function connectWebSocket() {
   state.connecting = true;
   clearTimeout(state.reconnectTimer);
 
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${protocol}//${location.host}/ws?token=${state.token}`);
+  let wsUrl;
+  if (state.relayMode) {
+    // Cloud relay mode: connect to relay server
+    wsUrl = state.relayUrl;
+  } else {
+    // LAN mode: connect to local server
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    wsUrl = `${protocol}//${location.host}/ws?token=${state.token}`;
+  }
+
+  const ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
     state.ws = ws;
     state.connected = true;
     state.connecting = false;
-    render();
-    // Request full tree
-    sendMessage('get_tree', {});
-    // Start ping interval
-    startPing();
+
+    if (state.relayMode) {
+      // In relay mode, send join_room with our public key
+      initCrypto();
+      ws.send(JSON.stringify({
+        type: 'join_room',
+        room_code: state.roomCode,
+        mobile_public_key: getPublicKeyBase64(),
+      }));
+    } else {
+      // LAN mode: request full tree immediately
+      render();
+      sendMessage('get_tree', {});
+      startPing();
+    }
   };
 
   ws.onmessage = (e) => {
     try {
-      const msg = JSON.parse(e.data);
+      const raw = JSON.parse(e.data);
+
+      if (state.relayMode && !state.sharedKey) {
+        // Handle relay protocol messages (pre-encryption)
+        if (raw.type === 'room_joined') {
+          // We got desktop's public key, derive shared secret
+          deriveSharedKey(raw.desktop_public_key);
+          state.screen = 'auth'; // Show PIN entry
+          render();
+          showToast('Connected to desktop, enter PIN', 'success');
+          startPing();
+          return;
+        }
+        if (raw.type === 'relay_error') {
+          state.authError = raw.message || 'Relay error';
+          state.connecting = false;
+          // Stop auto-reconnect on fatal relay errors (room not found, etc.)
+          state.roomCode = null;
+          clearTimeout(state.reconnectTimer);
+          render();
+          return;
+        }
+        if (raw.type === 'peer_disconnected') {
+          showToast('Desktop disconnected', 'error');
+          handleDisconnect();
+          return;
+        }
+        return;
+      }
+
+      // Handle encrypted messages (relay mode after pairing)
+      let msg = raw;
+      if (state.relayMode && raw.type === 'encrypted') {
+        msg = decryptMessage(raw);
+        if (!msg) return;
+      }
+      // Handle peer_disconnected even after pairing
+      if (raw.type === 'peer_disconnected') {
+        showToast('Desktop disconnected', 'error');
+        handleDisconnect();
+        return;
+      }
+
       handleServerMessage(msg);
     } catch (err) {
       console.warn('Failed to parse WebSocket message:', err);
@@ -190,8 +336,12 @@ function connectWebSocket() {
     stopPing();
     render();
 
-    // If we have a token, auto-reconnect
-    if (state.token && state.screen !== 'auth') {
+    // Auto-reconnect if we have credentials
+    const shouldReconnect = state.relayMode
+      ? (state.roomCode && state.screen !== 'connect')
+      : (state.token && state.screen !== 'auth');
+
+    if (shouldReconnect) {
       state.reconnectTimer = setTimeout(() => {
         connectWebSocket();
       }, RECONNECT_DELAY);
@@ -218,12 +368,18 @@ function stopPing() {
 
 function sendMessage(type, payload) {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify({
+    const msg = {
       type,
       id: crypto.randomUUID(),
       payload,
       timestamp: Date.now(),
-    }));
+    };
+
+    if (state.relayMode && state.sharedKey) {
+      state.ws.send(encryptMessage(msg));
+    } else {
+      state.ws.send(JSON.stringify(msg));
+    }
   }
 }
 
@@ -267,6 +423,24 @@ function handleServerMessage(msg) {
 
     case 'error':
       showToast(msg.payload.message || 'Server error', 'error');
+      break;
+
+    case 'auth_ok':
+      if (state.relayMode) {
+        state.sessionId = msg.payload.sessionId;
+        state.screen = 'tree';
+        state.prevScreen = 'auth';
+        state.loadingTree = true;
+        state.authError = null;
+        history.pushState({ screen: 'tree' }, '');
+        sendMessage('get_tree', {});
+      }
+      break;
+
+    case 'auth_fail':
+      if (state.relayMode) {
+        state.authError = msg.payload.reason || 'Authentication failed';
+      }
       break;
 
     default:
@@ -339,6 +513,9 @@ function render() {
   const transition = getTransitionClass();
 
   switch (state.screen) {
+    case 'connect':
+      app.innerHTML = renderConnect();
+      break;
     case 'auth':
       app.innerHTML = renderAuth();
       break;
@@ -401,6 +578,58 @@ function renderAuth() {
       ${state.authError ? `<div class="auth-error">${esc(state.authError)}</div>` : ''}
     </div>
   `;
+}
+
+// ─── Connect Screen (Relay Mode) ────────────────────────────────
+function renderConnect() {
+  return `
+    <div class="auth-screen">
+      <div class="auth-logo">ATM</div>
+      <h1 class="auth-title">ATM Remote</h1>
+      <p class="auth-subtitle">Enter the room code shown on your desktop</p>
+      <div style="margin-bottom:16px">
+        <input class="room-code-input" id="room-code-input" type="text"
+          placeholder="ATM-XXXXXX" maxlength="10" autocomplete="off"
+          autocorrect="off" spellcheck="false" autocapitalize="off"
+          style="font-size:24px;text-align:center;letter-spacing:4px;padding:12px 16px;width:100%;box-sizing:border-box;background:var(--bg-card);border:2px solid var(--border);border-radius:12px;color:var(--text);font-family:monospace;"
+          value="${esc(state.roomCode || '')}">
+      </div>
+      <button class="auth-btn" id="connect-relay-btn" ${state.connecting ? 'disabled' : ''}>
+        ${state.connecting ? '<span class="auth-loading"></span>' : 'Connect'}
+      </button>
+      ${state.authError ? '<div class="auth-error">' + esc(state.authError) + '</div>' : ''}
+      <div style="margin-top:24px;text-align:center">
+        <button class="link-btn" id="switch-to-lan" style="background:none;border:none;color:var(--text-dim);font-size:12px;cursor:pointer;text-decoration:underline;">
+          Connect via LAN instead
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function handleConnectRelay() {
+  const input = document.getElementById('room-code-input');
+  if (!input) return;
+  let code = input.value.trim();
+
+  // Normalize: add ATM- prefix if missing
+  if (!code.startsWith('ATM-')) {
+    code = 'ATM-' + code;
+  }
+
+  if (code.length < 7) {
+    state.authError = 'Room code too short';
+    render();
+    return;
+  }
+
+  state.relayMode = true;
+  state.roomCode = code;
+  state.relayUrl = state.relayUrl || 'wss://atm-relay.datafying.com';
+  state.authError = null;
+
+  connectWebSocket();
+  render();
 }
 
 // ─── Tree Screen ───────────────────────────────────────────────
@@ -813,6 +1042,28 @@ function renderEditScreen(node, kind) {
 
 // ─── Event Listeners ───────────────────────────────────────────
 function attachEventListeners() {
+  // --- Connect Screen (Relay) ---
+  if (state.screen === 'connect') {
+    const input = document.getElementById('room-code-input');
+    const btn = document.getElementById('connect-relay-btn');
+    const lanBtn = document.getElementById('switch-to-lan');
+
+    if (input) {
+      input.focus();
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') handleConnectRelay();
+      });
+    }
+    if (btn) btn.addEventListener('click', handleConnectRelay);
+    if (lanBtn) {
+      lanBtn.addEventListener('click', () => {
+        state.relayMode = false;
+        state.screen = 'auth';
+        render();
+      });
+    }
+  }
+
   // --- Auth Screen ---
   if (state.screen === 'auth') {
     attachPinListeners();
@@ -1191,6 +1442,13 @@ function handleDisconnect() {
   state.loadingTree = true;
   state.authError = null;
   state.authLocked = false;
+  state.relayMode = false;
+  state.roomCode = null;
+  state.relayUrl = null;
+  state.keyPair = null;
+  state.sharedKey = null;
+  state.peerPublicKey = null;
+  state.sendNonce = 0;
 
   render();
 }
@@ -1206,13 +1464,39 @@ function registerServiceWorker() {
 
 // ─── Init ──────────────────────────────────────────────────────
 function init() {
-  render();
+  // Check URL params for relay mode (from QR code scan)
+  const params = new URLSearchParams(window.location.search);
+  const relayCode = params.get('code');
+  const relayKey = params.get('key');
+  const relayUrlParam = params.get('relay');
+
+  if (relayCode) {
+    // QR code scanned - go directly to connecting
+    state.relayMode = true;
+    state.roomCode = relayCode;
+    state.relayUrl = relayUrlParam || 'wss://atm-relay.datafying.com';
+    state.peerPublicKey = relayKey;
+    state.screen = 'auth'; // Will switch after crypto handshake
+    render();
+    connectWebSocket();
+  } else if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1' && !window.location.hostname.match(/^192\.|^10\.|^172\./)) {
+    // Not on local network - show relay connect screen
+    state.screen = 'connect';
+    render();
+  } else {
+    // Local network - show PIN auth (existing behavior)
+    state.screen = 'auth';
+    render();
+  }
+
   registerServiceWorker();
 
   // Handle visibility change — reconnect if needed
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && state.token && !state.connected && state.screen !== 'auth') {
-      connectWebSocket();
+    if (document.visibilityState === 'visible' && !state.connected && state.screen !== 'auth' && state.screen !== 'connect') {
+      if (state.relayMode ? state.roomCode : state.token) {
+        connectWebSocket();
+      }
     }
   });
 
@@ -1232,7 +1516,7 @@ function init() {
   });
 
   // Push initial history state
-  history.replaceState({ screen: 'auth' }, '');
+  history.replaceState({ screen: state.screen }, '');
 }
 
 init();

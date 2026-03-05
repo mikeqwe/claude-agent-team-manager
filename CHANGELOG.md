@@ -1,5 +1,38 @@
 # ATM (Agent Team Manager) — Changelog
 
+## v0.8.1 — March 5, 2026
+
+### New Feature: Cloud Relay — Remote Access from Anywhere (GitHub Issue #14)
+- **Cloud relay mode** — connect to your ATM desktop from anywhere in the world, not just the same WiFi. Turn on "Cloud" mode in Settings, get a room code, enter it on your phone — it just works
+- **End-to-end encryption** — all messages between desktop and phone are encrypted with X25519 ECDH key exchange + XSalsa20-Poly1305 authenticated encryption. The relay server never sees plaintext
+- **Standalone relay server** — new `relay/` Rust crate: a lightweight WebSocket relay that forwards opaque encrypted blobs between desktop and mobile. Runs on `atm-relay.datafying.com`
+- **Room code system** — 8-character base58 room codes (e.g., `ATM-X7K3mP`) with 5-minute TTL for joining and 30-minute idle timeout
+- **QR code for instant pairing** — Settings panel shows a scannable QR code encoding the relay URL, room code, and desktop public key. Scan on phone to connect instantly
+- **LAN/Cloud mode toggle** — new mode selector in Settings panel. LAN mode unchanged; Cloud mode uses the encrypted relay. Switch freely between modes
+- **Custom relay URL** — advanced option to point at a self-hosted relay server instead of the default
+
+### Security
+- E2E encryption using tweetnacl-js (X25519 + XSalsa20-Poly1305, audited library)
+- Nonce space partitioned by role (desktop=0x01, mobile=0x02) to prevent nonce collisions
+- Relay server rate limiting: per-IP connection limits, room creation throttling, message rate limiting
+- Room codes use cryptographically random base58 characters
+- Relay never stores data to disk, never logs message content
+
+### Technical
+- New Rust crate: `relay/` with axum 0.8, dashmap, governor rate limiting
+- New Rust module: `src-tauri/src/remote/relay_client.rs` — outbound WSS client to relay
+- New Tauri commands: `connect_to_relay`, `disconnect_from_relay`, `get_relay_status`, `send_to_relay`
+- New TypeScript class: `CryptoSession` in `remote-sync.ts` for E2E encryption
+- Updated `remote-sync.ts` with `initRelay()`, dual-mode broadcasting, encrypted message handling
+- Updated `ui-store.ts` with `relayStatus`, `connectRelay()`, `disconnectRelay()`
+- Updated `SettingsPanel.tsx` with LAN/Cloud toggle, room code display, QR code
+- Updated mobile client `app.js` with room code entry, relay WebSocket, E2E crypto
+- Added `tweetnacl` and `tweetnacl-util` npm dependencies
+- Added `tokio-tungstenite` Cargo dependency for outbound WSS
+- Deployment files: Dockerfile, systemd service, Caddyfile for relay server
+
+---
+
 ## v0.8.0 — March 4, 2026
 
 ### New Feature: Remote Access from Mobile (GitHub Issue #14)

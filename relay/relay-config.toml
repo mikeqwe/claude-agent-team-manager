@@ -1,0 +1,28 @@
+# ATM Cloud Relay Server Configuration
+# Override defaults by setting values here or via environment variables.
+# Environment variable format: RELAY_<UPPERCASE_KEY> (e.g., RELAY_LISTEN_ADDR)
+
+# Address and port to listen on
+listen_addr = "127.0.0.1:8080"
+
+# Maximum number of active rooms
+max_rooms = 500
+
+# Maximum total WebSocket connections
+max_connections = 2000
+
+# Seconds before an unpaired room expires (mobile hasn't joined yet)
+room_ttl_secs = 300
+
+# Seconds of inactivity before a paired room is closed
+idle_timeout_secs = 1800
+
+# Maximum WebSocket message size in bytes
+max_message_size = 65536
+
+# Per-IP limits
+per_ip_max_connections = 5
+per_ip_max_rooms_per_hour = 10
+
+# Messages per second per connection
+msg_rate_limit_per_sec = 100

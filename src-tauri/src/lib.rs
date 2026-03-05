@@ -1,6 +1,6 @@
 mod remote;
 
-use remote::ServerHandle;
+use remote::{RelayClient, ServerHandle};
 use std::process::Command as StdCommand;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
@@ -524,6 +524,95 @@ fn generate_qr_code(url: String) -> Result<String, String> {
     remote::generate_qr_data_uri(&url)
 }
 
+// ─── Cloud Relay Commands ───────────────────────────────────────────
+
+/// Connect to the cloud relay server and create a room.
+#[tauri::command]
+async fn connect_to_relay(
+    app: tauri::AppHandle,
+    relay_url: String,
+    public_key: String,
+) -> Result<serde_json::Value, String> {
+    // Check if already connected
+    if let Some(state) = app.try_state::<tokio::sync::Mutex<Option<RelayClient>>>() {
+        let guard = state.lock().await;
+        if guard.is_some() {
+            return Err("Already connected to relay".to_string());
+        }
+    }
+
+    let client = RelayClient::connect(&relay_url, &public_key, app.clone()).await?;
+    let room_code = client.room_code.clone();
+
+    // Emit room created event
+    let _ = app.emit(
+        "relay:room-created",
+        serde_json::json!({ "room_code": room_code }),
+    );
+
+    {
+        let state = app
+            .try_state::<tokio::sync::Mutex<Option<RelayClient>>>()
+            .ok_or("Relay state not initialized")?;
+        let mut guard = state.lock().await;
+        *guard = Some(client);
+    }
+
+    Ok(serde_json::json!({
+        "room_code": room_code,
+    }))
+}
+
+/// Disconnect from the cloud relay.
+#[tauri::command]
+async fn disconnect_from_relay(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app
+        .try_state::<tokio::sync::Mutex<Option<RelayClient>>>()
+        .ok_or("Relay not initialized")?;
+
+    let mut guard = state.lock().await;
+    if let Some(client) = guard.take() {
+        client.disconnect();
+    }
+
+    let _ = app.emit("relay:disconnected", serde_json::json!({}));
+    Ok(())
+}
+
+/// Get the current relay connection status.
+#[tauri::command]
+async fn get_relay_status(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let state = app.try_state::<tokio::sync::Mutex<Option<RelayClient>>>();
+
+    match state {
+        Some(state) => {
+            let guard = state.lock().await;
+            match guard.as_ref() {
+                Some(client) => Ok(serde_json::json!({
+                    "connected": true,
+                    "room_code": client.room_code,
+                })),
+                None => Ok(serde_json::json!({ "connected": false })),
+            }
+        }
+        None => Ok(serde_json::json!({ "connected": false })),
+    }
+}
+
+/// Send an encrypted message to the relay (forwarded to mobile peer).
+#[tauri::command]
+async fn send_to_relay(app: tauri::AppHandle, data: String) -> Result<(), String> {
+    let state = app
+        .try_state::<tokio::sync::Mutex<Option<RelayClient>>>()
+        .ok_or("Relay not initialized")?;
+
+    let guard = state.lock().await;
+    match guard.as_ref() {
+        Some(client) => client.send(&data),
+        None => Err("Not connected to relay".to_string()),
+    }
+}
+
 // ─── App Entry Point ────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -548,6 +637,11 @@ pub fn run() {
             generate_qr_code,
             broadcast_to_remote,
             sync_state_to_remote,
+            // Cloud relay commands.
+            connect_to_relay,
+            disconnect_from_relay,
+            get_relay_status,
+            send_to_relay,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -560,6 +654,9 @@ pub fn run() {
 
             // Initialize the remote server handle slot (server is OFF by default).
             app.manage(Mutex::new(None::<ServerHandle>));
+
+            // Initialize the relay client slot (relay is OFF by default).
+            app.manage(tokio::sync::Mutex::new(None::<RelayClient>));
 
             Ok(())
         })

@@ -490,6 +490,19 @@ interface RemoteInfo {
   qrDataUri?: string;
 }
 
+const modeTabStyle = (active: boolean): CSSProperties => ({
+  flex: 1,
+  padding: "8px 0",
+  background: active ? "var(--accent-blue)" : "transparent",
+  color: active ? "#fff" : "var(--text-secondary)",
+  border: active ? "none" : "1px solid var(--border-color)",
+  borderRadius: 6,
+  cursor: "pointer",
+  fontSize: 12,
+  fontWeight: 600,
+  transition: "all 0.15s",
+});
+
 function RemoteAccessSection() {
   const remoteConfig = useUiStore((s) => s.remoteConfig);
   const remoteConnected = useUiStore((s) => s.remoteConnected);
@@ -498,6 +511,9 @@ function RemoteAccessSection() {
   const saveRemoteConfigFn = useUiStore((s) => s.saveRemoteConfig);
   const connectRemote = useUiStore((s) => s.connectRemote);
   const disconnectRemote = useUiStore((s) => s.disconnectRemote);
+  const relayStatus = useUiStore((s) => s.relayStatus);
+  const connectRelay = useUiStore((s) => s.connectRelay);
+  const disconnectRelay = useUiStore((s) => s.disconnectRelay);
   const projectPath = useTreeStore((s) => s.projectPath);
 
   const saveRemoteConfig = useCallback(async () => {
@@ -507,8 +523,10 @@ function RemoteAccessSection() {
   const [remoteInfo, setRemoteInfo] = useState<RemoteInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [serverRunning, setServerRunning] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
-  const handleToggle = async (enabled: boolean) => {
+  // ── LAN mode toggle ──
+  const handleLanToggle = async (enabled: boolean) => {
     setLoading(true);
     setRemoteConfig({ enabled });
     try {
@@ -517,7 +535,6 @@ function RemoteAccessSection() {
           port: remoteConfig.port,
           exposeOnNetwork: remoteConfig.exposeOnNetwork,
         });
-        // Generate QR code for the URL
         try {
           const qrDataUri = await invoke<string>("generate_qr_code", { url: info.url });
           info.qrDataUri = qrDataUri;
@@ -540,11 +557,82 @@ function RemoteAccessSection() {
     setLoading(false);
   };
 
+  // ── Cloud mode toggle ──
+  const handleCloudToggle = async (enabled: boolean) => {
+    setLoading(true);
+    setRemoteConfig({ enabled });
+    try {
+      if (enabled) {
+        await connectRelay(remoteConfig.relayUrl);
+        // Generate QR code with relay info — read fresh state after await
+        const status = useUiStore.getState().relayStatus;
+        if (status.roomCode && status.publicKey) {
+          const qrContent = `https://atm.datafying.com?code=${status.roomCode}&key=${encodeURIComponent(status.publicKey)}&relay=${encodeURIComponent(remoteConfig.relayUrl)}`;
+          try {
+            const qrDataUri = await invoke<string>("generate_qr_code", { url: qrContent });
+            setRemoteInfo({
+              url: remoteConfig.relayUrl,
+              port: 0,
+              ip: "",
+              pin: "",
+              certFingerprint: "",
+              qrDataUri,
+            });
+          } catch { /* QR optional */ }
+        }
+        setServerRunning(true);
+      } else {
+        disconnectRelay();
+        setRemoteInfo(null);
+        setServerRunning(false);
+      }
+    } catch (err) {
+      console.warn("[Settings] Cloud relay error:", err);
+      toast(err instanceof Error ? err.message : String(err), "error");
+      setRemoteConfig({ enabled: false });
+    }
+    await saveRemoteConfig();
+    setLoading(false);
+  };
+
+  const handleToggle = (enabled: boolean) => {
+    if (remoteConfig.mode === "cloud") {
+      handleCloudToggle(enabled);
+    } else {
+      handleLanToggle(enabled);
+    }
+  };
+
+  const handleModeSwitch = async (mode: "lan" | "cloud") => {
+    if (mode === remoteConfig.mode) return;
+    // If currently enabled, disable first
+    if (remoteConfig.enabled) {
+      await handleToggle(false);
+    }
+    setRemoteConfig({ mode });
+    await saveRemoteConfig();
+  };
+
   const dotColor = serverRunning ? "#3fb950" : loading ? "#f0883e" : "#f85149";
 
   return (
     <>
       <div style={sectionStyle}>Remote Access</div>
+
+      {/* Mode selector */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+        <button style={modeTabStyle(remoteConfig.mode === "lan")} onClick={() => handleModeSwitch("lan")}>
+          LAN
+        </button>
+        <button style={modeTabStyle(remoteConfig.mode === "cloud")} onClick={() => handleModeSwitch("cloud")}>
+          Cloud
+        </button>
+      </div>
+      <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 12 }}>
+        {remoteConfig.mode === "lan"
+          ? "Direct connection on the same WiFi network. Fastest latency."
+          : "Connect from anywhere via encrypted cloud relay. Works over the internet."}
+      </div>
 
       {/* Enable toggle */}
       <label
@@ -564,7 +652,7 @@ function RemoteAccessSection() {
           style={{ width: 16, height: 16, cursor: "pointer" }}
         />
         <span style={{ fontSize: 13, color: "var(--text-primary)" }}>
-          Enable remote access server
+          {remoteConfig.mode === "cloud" ? "Enable cloud remote access" : "Enable LAN remote access"}
         </span>
       </label>
 
@@ -593,13 +681,52 @@ function RemoteAccessSection() {
               }}
             />
             <span style={{ fontSize: 12, color: "var(--text-primary)", flex: 1 }}>
-              {serverRunning
-                ? `Running${remoteClientCount > 0 ? ` \u00b7 ${remoteClientCount} client${remoteClientCount !== 1 ? "s" : ""}` : ""}`
-                : loading ? "Starting..." : "Stopped"}
+              {remoteConfig.mode === "cloud"
+                ? (relayStatus.connected
+                  ? (relayStatus.clientConnected
+                    ? `Connected \u00b7 Mobile paired`
+                    : `Waiting for mobile \u00b7 Room ${relayStatus.roomCode || "..."}`)
+                  : loading ? "Connecting to relay..." : "Disconnected")
+                : (serverRunning
+                  ? `Running${remoteClientCount > 0 ? ` \u00b7 ${remoteClientCount} client${remoteClientCount !== 1 ? "s" : ""}` : ""}`
+                  : loading ? "Starting..." : "Stopped")}
             </span>
           </div>
 
-          {/* QR Code */}
+          {/* ── Cloud mode: Room code + QR ── */}
+          {remoteConfig.mode === "cloud" && relayStatus.roomCode && (
+            <>
+              {/* Room code display */}
+              <div style={{ marginBottom: 12 }}>
+                <label style={labelStyle}>Room Code</label>
+                <div
+                  style={{
+                    fontSize: 32,
+                    fontWeight: 700,
+                    letterSpacing: "4px",
+                    color: "var(--accent-blue)",
+                    textAlign: "center",
+                    padding: "12px 0",
+                    fontFamily: "monospace",
+                    cursor: "pointer",
+                    userSelect: "all",
+                  }}
+                  onClick={() => {
+                    navigator.clipboard.writeText(relayStatus.roomCode || "");
+                    toast("Room code copied", "success");
+                  }}
+                  title="Click to copy"
+                >
+                  {relayStatus.roomCode}
+                </div>
+                <div style={{ fontSize: 11, color: "var(--text-secondary)", textAlign: "center" }}>
+                  Enter this code on your phone, or scan the QR code below
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* QR Code (both modes) */}
           {remoteInfo?.qrDataUri && (
             <div
               style={{
@@ -621,8 +748,8 @@ function RemoteAccessSection() {
             </div>
           )}
 
-          {/* URL and PIN */}
-          {remoteInfo && (
+          {/* ── LAN mode: URL and PIN ── */}
+          {remoteConfig.mode === "lan" && remoteInfo && (
             <div style={{ marginBottom: 12 }}>
               <label style={labelStyle}>Server URL</label>
               <div
@@ -644,7 +771,7 @@ function RemoteAccessSection() {
             </div>
           )}
 
-          {remoteInfo?.pin && (
+          {remoteConfig.mode === "lan" && remoteInfo?.pin && (
             <div style={{ marginBottom: 12 }}>
               <label style={labelStyle}>PIN Code</label>
               <div
@@ -666,47 +793,107 @@ function RemoteAccessSection() {
             </div>
           )}
 
-          {/* Port configuration */}
-          <div style={{ marginBottom: 8 }}>
-            <label style={labelStyle}>Port</label>
-            <input
-              type="number"
-              min={1024}
-              max={65535}
-              style={{ ...inputStyle, width: 100 }}
-              value={remoteConfig.port}
-              onChange={(e) => setRemoteConfig({ port: parseInt(e.target.value) || 5175 })}
-              onBlur={saveRemoteConfig}
-            />
-          </div>
-
-          {/* Network exposure toggle */}
-          <label
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              cursor: "pointer",
-              marginBottom: 8,
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={remoteConfig.exposeOnNetwork}
-              onChange={(e) => {
-                setRemoteConfig({ exposeOnNetwork: e.target.checked });
-                saveRemoteConfig();
+          {/* E2E encryption badge (cloud mode) */}
+          {remoteConfig.mode === "cloud" && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "6px 10px",
+                background: "rgba(63, 185, 80, 0.08)",
+                border: "1px solid rgba(63, 185, 80, 0.2)",
+                borderRadius: 6,
+                marginBottom: 12,
               }}
-              style={{ width: 14, height: 14, cursor: "pointer" }}
-            />
-            <span style={{ fontSize: 12, color: "var(--text-primary)" }}>
-              Expose on local network (0.0.0.0)
-            </span>
-          </label>
-          <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>
-            When disabled, only accessible from this machine (127.0.0.1).
-            Enable to allow connections from other devices on your LAN.
-          </div>
+            >
+              <span style={{ fontSize: 12 }}>&#128274;</span>
+              <span style={{ fontSize: 11, color: "#3fb950" }}>
+                End-to-end encrypted — relay cannot read your data
+              </span>
+            </div>
+          )}
+
+          {/* ── LAN mode config ── */}
+          {remoteConfig.mode === "lan" && (
+            <>
+              <div style={{ marginBottom: 8 }}>
+                <label style={labelStyle}>Port</label>
+                <input
+                  type="number"
+                  min={1024}
+                  max={65535}
+                  style={{ ...inputStyle, width: 100 }}
+                  value={remoteConfig.port}
+                  onChange={(e) => setRemoteConfig({ port: parseInt(e.target.value) || 5175 })}
+                  onBlur={saveRemoteConfig}
+                />
+              </div>
+
+              <label
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  cursor: "pointer",
+                  marginBottom: 8,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={remoteConfig.exposeOnNetwork}
+                  onChange={(e) => {
+                    setRemoteConfig({ exposeOnNetwork: e.target.checked });
+                    saveRemoteConfig();
+                  }}
+                  style={{ width: 14, height: 14, cursor: "pointer" }}
+                />
+                <span style={{ fontSize: 12, color: "var(--text-primary)" }}>
+                  Expose on local network (0.0.0.0)
+                </span>
+              </label>
+              <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>
+                When disabled, only accessible from this machine (127.0.0.1).
+                Enable to allow connections from other devices on your LAN.
+              </div>
+            </>
+          )}
+
+          {/* ── Advanced section (cloud mode) ── */}
+          {remoteConfig.mode === "cloud" && (
+            <>
+              <button
+                onClick={() => setShowAdvanced(!showAdvanced)}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "var(--text-secondary)",
+                  fontSize: 11,
+                  cursor: "pointer",
+                  padding: "4px 0",
+                  textDecoration: "underline",
+                }}
+              >
+                {showAdvanced ? "Hide advanced" : "Advanced settings"}
+              </button>
+              {showAdvanced && (
+                <div style={{ marginTop: 8 }}>
+                  <label style={labelStyle}>Custom Relay URL</label>
+                  <input
+                    type="text"
+                    style={{ ...inputStyle, fontSize: 12, fontFamily: "monospace" }}
+                    value={remoteConfig.relayUrl}
+                    onChange={(e) => setRemoteConfig({ relayUrl: e.target.value })}
+                    onBlur={saveRemoteConfig}
+                    placeholder="wss://atm-relay.datafying.com"
+                  />
+                  <div style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: 4 }}>
+                    Self-host the relay server for full control. Default: wss://atm-relay.datafying.com
+                  </div>
+                </div>
+              )}
+            </>
+          )}
         </div>
       )}
     </>

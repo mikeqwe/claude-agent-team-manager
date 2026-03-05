@@ -1,0 +1,25 @@
+[Unit]
+Description=ATM WebSocket Relay
+After=network-online.target caddy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=atm-relay
+Group=atm-relay
+ExecStart=/opt/atm-relay/bin/atm-relay
+Restart=always
+RestartSec=5
+MemoryMax=500M
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/atm-relay
+StandardOutput=journal
+StandardError=journal
+Environment="RUST_LOG=atm_relay=info"
+Environment="RELAY_CONFIG=/opt/atm-relay/relay-config.toml"
+
+[Install]
+WantedBy=multi-user.target
